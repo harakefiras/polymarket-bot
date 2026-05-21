@@ -70,4 +70,4 @@ def place_order(trade):
 def run():
     global daily_pnl, pnl_date
     log.info("Polymarket Copy Bot v2 demarre")
-    log.info(f"Whale min: {MIN_WHALE_USDC} USDC | Mise
+    log.info("Whale min: " + str(MIN_WHALE_USDC) + " USDC | Mise: " + str(BET_SIZE_USDC) + " USDC | Stop-loss: -" + str(STOP_LOSS_USDC) + " USDC/jour")
