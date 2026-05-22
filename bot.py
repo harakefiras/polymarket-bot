@@ -48,11 +48,14 @@ def get_btc_market():
         r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
         if r.ok:
             data = r.json()
-            if isinstance(data, list) and len(data) > 0:
+            market = data[0] if isinstance(data, list) and len(data) > 0 else data if isinstance(data, dict) else None
+            if market:
                 log.info("Marche BTC 5m trouve!")
-                return data[0], window_ts
-            elif isinstance(data, dict):
-                return data, window_ts
+                cid = market.get("conditionId") or market.get("condition_id","")
+                r2 = requests.get(GAMMA_API + "/markets/" + cid, timeout=10)
+                if r2.ok:
+                    return r2.json(), window_ts
+                return market, window_ts
         return None, None
     except Exception as e:
         log.error("Erreur marche: " + str(e))
