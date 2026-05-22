@@ -21,16 +21,16 @@ traded_markets = set()
 
 def get_btc_markets():
     try:
-        r = requests.get(
-            GAMMA_API + "/markets",
-            params={"active": "true", "limit": 100},
-            timeout=10
-        )
+        import time as t
+        now = int(t.time())
+        window_ts = now - (now % 300)
+        slug = "btc-updown-5m-" + str(window_ts)
+        r = requests.get(GAMMA_API + "/events", params={"slug": slug}, timeout=10)
         if r.ok:
-            all_markets = r.json()
-            btc5m = [m for m in all_markets if "5m" in m.get("slug","").lower() or "5m" in m.get("question","").lower() or "updown" in m.get("slug","").lower()]
-            log.info("Marches BTC 5m trouves: " + str(len(btc5m)))
-            return btc5m
+            data = r.json()
+            markets = data.get("markets", []) if isinstance(data, dict) else []
+            log.info("Marches BTC 5m trouves: " + str(len(markets)))
+            return markets
         return []
     except Exception as e:
         log.error("Erreur marches: " + str(e))
