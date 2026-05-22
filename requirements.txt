@@ -1,2 +1,2 @@
 requests==2.31.0
-polymarket-apis==0.5.7
+py-clob-client-v2==1.0.1
