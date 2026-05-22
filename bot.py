@@ -88,13 +88,12 @@ def place_order(token_id, side, price):
         from py_clob_client.clob_types import OrderArgs, OrderType
         size = round(BET_SIZE_USDC / price, 2)
         order_args = OrderArgs(
-            token_id=token_id,
-            price=round(price, 4),
-            size=size,
-            side="BUY",
-            order_type=OrderType.GTC,
-        )
-        resp = clob_client.create_and_post_order(order_args)
+    token_id=token_id,
+    price=round(price, 4),
+    size=size,
+    side="BUY",
+)
+resp = clob_client.create_and_post_order(order_args)
         log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
         open_positions.append({"size": BET_SIZE_USDC})
         return True
