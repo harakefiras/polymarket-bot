@@ -48,13 +48,17 @@ def get_btc_market():
         r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
         if r.ok:
             data = r.json()
-            market = data[0] if isinstance(data, list) and len(data) > 0 else data if isinstance(data, dict) else None
+            market = data[0] if isinstance(data, list) and len(data) > 0 else None
             if market:
-                log.info("Marche BTC 5m trouve!")
-                cid = market.get("conditionId") or market.get("condition_id","")
-                r2 = requests.get(GAMMA_API + "/markets/" + cid, timeout=10)
-                if r2.ok:
-                    return r2.json(), window_ts
+                log.info("Marche trouve! tokens: " + str(market.keys()))
+                outcomes = market.get("outcomes", "[]")
+                token_ids = market.get("clobTokenIds", "[]")
+                import json
+                outcomes = json.loads(outcomes) if isinstance(outcomes, str) else outcomes
+                token_ids = json.loads(token_ids) if isinstance(token_ids, str) else token_ids
+                tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+                market["tokens"] = tokens
+                log.info("Tokens: " + str(tokens))
                 return market, window_ts
         return None, None
     except Exception as e:
