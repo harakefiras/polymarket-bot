@@ -5,6 +5,7 @@ PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "5"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "20"))
+MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "50"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
 TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.80"))
@@ -27,6 +28,9 @@ open_positions = []
 
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
+
+def open_val():
+    return sum(p["size"] for p in open_positions)
 
 def get_active_markets():
     try:
@@ -173,7 +177,7 @@ async def sell_order_async(token_id, shares, reason, price):
                 size=str(round(shares, 2)),
             )
             if response.ok:
-                log.info("VENTE " + reason + " @ " + str(round(price, 2)) + " | order_id=" + str(response.order_id))
+                log.info("VENTE " + reason + " @ " + str(round(price, 2)))
                 return True
             else:
                 log.error("Erreur vente: " + str(response.message))
@@ -253,8 +257,8 @@ def monitor_positions():
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Dual Strategy v2 + TP/SL + Anti-doublon demarre!")
-    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss jour: " + str(STOP_LOSS_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL/trade: " + str(STOP_LOSS_PRICE))
+    log.info("Bot Dual Strategy v3 demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL: " + str(STOP_LOSS_PRICE))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -281,60 +285,71 @@ def run():
 
             monitor_positions()
 
+            log.info("Positions ouvertes: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " USDC")
+
             # ─── STRATEGIE 1 : Copy Whales ───────────────────────
-            log.info("=== COPY WHALES ===")
-            markets = get_active_markets()
-            whales = detect_whales(markets)
-            if whales:
-                log.info(str(len(whales)) + " whale(s) unique(s)!")
-                for w in whales:
-                    if check_stop_loss():
-                        break
-                    log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
-                    time.sleep(5)
-                    price = get_token_price(w["token_id"])
-                    if price <= 0:
-                        price = w["price"]
-                    if 0.30 <= price <= 0.70:
-                        if place_order(w["token_id"], w["outcome"], price):
-                            seen_trades.add(w["id"])
-                            traded_markets.add(w["market_id"])
-                    else:
-                        log.info("Prix hors fourchette: " + str(round(price, 2)))
+            if open_val() < MAX_OPEN_USDC:
+                log.info("=== COPY WHALES ===")
+                markets = get_active_markets()
+                whales = detect_whales(markets)
+                if whales:
+                    log.info(str(len(whales)) + " whale(s) unique(s)!")
+                    for w in whales:
+                        if check_stop_loss():
+                            break
+                        if open_val() + BET_SIZE_USDC > MAX_OPEN_USDC:
+                            log.info("Plafond atteint - stop mises")
+                            break
+                        log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
+                        time.sleep(5)
+                        price = get_token_price(w["token_id"])
+                        if price <= 0:
+                            price = w["price"]
+                        if 0.30 <= price <= 0.70:
+                            if place_order(w["token_id"], w["outcome"], price):
+                                seen_trades.add(w["id"])
+                                traded_markets.add(w["market_id"])
+                        else:
+                            log.info("Prix hors fourchette: " + str(round(price, 2)))
+                else:
+                    log.info("Aucune whale")
             else:
-                log.info("Aucune whale")
+                log.info("Plafond atteint - pas de nouvelles mises whales")
 
             if check_stop_loss():
                 continue
 
             # ─── STRATEGIE 2 : BTC 5m ────────────────────────────
-            log.info("=== BTC 5M ===")
-            score, btc_price = get_btc_analysis()
-            market, window_ts = get_btc_market()
+            if open_val() < MAX_OPEN_USDC:
+                log.info("=== BTC 5M ===")
+                score, btc_price = get_btc_analysis()
+                market, window_ts = get_btc_market()
 
-            if market and window_ts not in traded_windows:
-                if score >= 3:
-                    target = "Up"
-                elif score <= -3:
-                    target = "Down"
-                else:
-                    target = None
-                    log.info("Signal BTC faible (score=" + str(score) + ")")
+                if market and window_ts not in traded_windows:
+                    if score >= 3:
+                        target = "Up"
+                    elif score <= -3:
+                        target = "Down"
+                    else:
+                        target = None
+                        log.info("Signal BTC faible (score=" + str(score) + ")")
 
-                if target:
-                    for token in market.get("tokens", []):
-                        if token["outcome"] == target:
-                            token_id = token["token_id"]
-                            price = get_token_price(token_id)
-                            if price <= 0:
-                                price = 0.5
-                            log.info(target + " @ " + str(round(price, 2)))
-                            time.sleep(15)
-                            if 0.40 <= price <= 0.65:
-                                if place_order(token_id, target, price):
-                                    traded_windows.add(window_ts)
-                            else:
-                                log.info("Prix BTC hors fourchette: " + str(round(price, 2)))
+                    if target:
+                        for token in market.get("tokens", []):
+                            if token["outcome"] == target:
+                                token_id = token["token_id"]
+                                price = get_token_price(token_id)
+                                if price <= 0:
+                                    price = 0.5
+                                log.info(target + " @ " + str(round(price, 2)))
+                                time.sleep(15)
+                                if 0.40 <= price <= 0.65:
+                                    if place_order(token_id, target, price):
+                                        traded_windows.add(window_ts)
+                                else:
+                                    log.info("Prix BTC hors fourchette: " + str(round(price, 2)))
+            else:
+                log.info("Plafond atteint - pas de trade BTC")
 
         except Exception as e:
             log.error("Erreur: " + str(e))
