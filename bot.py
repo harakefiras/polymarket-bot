@@ -7,6 +7,8 @@ BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "5"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "20"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
+TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.80"))
+STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -20,6 +22,7 @@ daily_pnl = 0.0
 pnl_date = date.today()
 seen_trades = set()
 traded_windows = set()
+open_positions = []
 
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
@@ -89,7 +92,6 @@ def get_btc_analysis():
         last_price = closes[-1]
 
         trend = sum(1 if closes[i] > opens[i] else -1 for i in range(-6, 0))
-
         gains, losses = [], []
         for i in range(1, len(closes)):
             diff = closes[i] - closes[i-1]
@@ -98,11 +100,9 @@ def get_btc_analysis():
         avg_gain = sum(gains[-14:]) / 14
         avg_loss = sum(losses[-14:]) / 14
         rsi = 100 if avg_loss == 0 else 100 - (100 / (1 + avg_gain / avg_loss))
-
         ma5 = sum(closes[-5:]) / 5
         ma10 = sum(closes[-10:]) / 10
         ma_signal = 1 if ma5 > ma10 else -1
-
         avg_vol = sum(volumes[-10:]) / 10
         vol_ok = volumes[-1] > avg_vol
 
@@ -116,7 +116,7 @@ def get_btc_analysis():
         if vol_ok and score > 0: score += 1
         elif vol_ok and score < 0: score -= 1
 
-        log.info("BTC: " + str(round(last_price, 0)) + " | RSI: " + str(round(rsi, 1)) + " | MA: " + ("UP" if ma_signal > 0 else "DOWN") + " | Score: " + str(score))
+        log.info("BTC: " + str(round(last_price, 0)) + " | RSI: " + str(round(rsi, 1)) + " | Score: " + str(score))
         return score, last_price
     except Exception as e:
         log.error("Erreur Binance: " + str(e))
@@ -151,10 +151,37 @@ def get_token_price(token_id):
     except:
         return 0
 
-async def place_order_async(token_id, outcome, price):
+async def sell_order_async(token_id, shares, reason):
     try:
         from polymarket import AsyncSecureClient
-        size = str(round(BET_SIZE_USDC / price, 2))
+        async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=WALLET,
+        ) as client:
+            response = await client.place_limit_order(
+                token_id=token_id,
+                side="SELL",
+                price=str(TAKE_PROFIT_PRICE if reason == "TP" else STOP_LOSS_PRICE),
+                size=str(round(shares, 2)),
+            )
+            if response.ok:
+                log.info("VENTE " + reason + " | order_id=" + str(response.order_id))
+                return True
+            else:
+                log.error("Erreur vente: " + str(response.message))
+                return False
+    except Exception as e:
+        log.error("Exception vente: " + str(e))
+        return False
+
+def sell_order(token_id, shares, reason):
+    return asyncio.run(sell_order_async(token_id, shares, reason))
+
+async def place_order_async(token_id, outcome, price):
+    global daily_pnl
+    try:
+        from polymarket import AsyncSecureClient
+        shares = round(BET_SIZE_USDC / price, 2)
         async with await AsyncSecureClient.create(
             private_key=PRIVATE_KEY,
             wallet=WALLET,
@@ -163,10 +190,17 @@ async def place_order_async(token_id, outcome, price):
                 token_id=token_id,
                 side="BUY",
                 price=str(round(price, 4)),
-                size=size,
+                size=str(shares),
             )
             if response.ok:
-                log.info("TRADE " + outcome + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | order_id=" + str(response.order_id))
+                log.info("TRADE " + outcome + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)))
+                open_positions.append({
+                    "token_id": token_id,
+                    "entry_price": price,
+                    "shares": shares,
+                    "size": BET_SIZE_USDC,
+                    "outcome": outcome,
+                })
                 return True
             else:
                 log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -178,10 +212,42 @@ async def place_order_async(token_id, outcome, price):
 def place_order(token_id, outcome, price):
     return asyncio.run(place_order_async(token_id, outcome, price))
 
+def monitor_positions():
+    global daily_pnl, open_positions
+    to_remove = []
+    for pos in open_positions:
+        token_id = pos["token_id"]
+        current = get_token_price(token_id)
+        if current <= 0:
+            continue
+        entry = pos["entry_price"]
+        shares = pos["shares"]
+        log.info("Position " + pos["outcome"] + " | Entry: " + str(round(entry, 2)) + " | Current: " + str(round(current, 2)))
+
+        if current >= TAKE_PROFIT_PRICE:
+            log.info("TAKE PROFIT! " + str(round(current, 2)))
+            if sell_order(token_id, shares, "TP"):
+                pnl = (current - entry) * shares
+                daily_pnl += pnl
+                log.info("PnL: +" + str(round(pnl, 2)) + " USDC")
+                to_remove.append(pos)
+
+        elif current <= STOP_LOSS_PRICE:
+            log.info("STOP LOSS! " + str(round(current, 2)))
+            if sell_order(token_id, shares, "SL"):
+                pnl = (current - entry) * shares
+                daily_pnl += pnl
+                log.info("PnL: " + str(round(pnl, 2)) + " USDC")
+                to_remove.append(pos)
+
+    for pos in to_remove:
+        if pos in open_positions:
+            open_positions.remove(pos)
+
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Dual Strategy demarre!")
-    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Whale min: " + str(MIN_WHALE_USDC))
+    log.info("Bot Dual Strategy + TP/SL demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss jour: " + str(STOP_LOSS_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL/trade: " + str(STOP_LOSS_PRICE))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -201,21 +267,23 @@ def run():
                 traded_windows.clear()
 
             if check_stop_loss():
-                log.warning("Stop-loss atteint (" + str(round(daily_pnl, 2)) + " USDC). Pause 1h.")
+                log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
                 continue
+
+            # Surveille les positions ouvertes
+            monitor_positions()
 
             # ─── STRATEGIE 1 : Copy Whales ───────────────────────
             log.info("=== COPY WHALES ===")
             markets = get_active_markets()
-            log.info("Marches: " + str(len(markets)))
             whales = detect_whales(markets)
             if whales:
-                log.info(str(len(whales)) + " whale(s) detectee(s)!")
+                log.info(str(len(whales)) + " whale(s)!")
                 for w in whales:
                     if check_stop_loss():
                         break
-                    log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
+                    log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
                     time.sleep(5)
                     price = get_token_price(w["token_id"])
                     if price <= 0:
@@ -226,7 +294,7 @@ def run():
                     else:
                         log.info("Prix hors fourchette: " + str(round(price, 2)))
             else:
-                log.info("Aucune whale detectee")
+                log.info("Aucune whale")
 
             if check_stop_loss():
                 continue
@@ -239,13 +307,11 @@ def run():
             if market and window_ts not in traded_windows:
                 if score >= 3:
                     target = "Up"
-                    log.info("Signal fort UP (score=" + str(score) + ")")
                 elif score <= -3:
                     target = "Down"
-                    log.info("Signal fort DOWN (score=" + str(score) + ")")
                 else:
-                    log.info("Signal BTC faible (score=" + str(score) + ") - pas de trade")
                     target = None
+                    log.info("Signal BTC faible (score=" + str(score) + ")")
 
                 if target:
                     for token in market.get("tokens", []):
@@ -261,8 +327,6 @@ def run():
                                     traded_windows.add(window_ts)
                             else:
                                 log.info("Prix BTC hors fourchette: " + str(round(price, 2)))
-            else:
-                log.info("BTC: marche deja trade ou introuvable")
 
         except Exception as e:
             log.error("Erreur: " + str(e))
