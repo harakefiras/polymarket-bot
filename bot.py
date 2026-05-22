@@ -31,12 +31,23 @@ def get_active_markets():
 
 def get_recent_trades(market_id):
     try:
-        r = requests.get(DATA_API + "/trades", params={"market": market_id, "limit": 20}, timeout=10)
-        return r.json() if r.ok else []
+        r = requests.get(
+            DATA_API + "/trades",
+            params={"market": market_id, "limit": 20},
+            timeout=10
+        )
+        if not r.ok:
+            return []
+        trades = r.json()
+        if not isinstance(trades, list):
+            return []
+        for t in trades:
+            if "asset_id" in t and t["asset_id"].startswith("0x"):
+                t["asset_id"] = str(int(t["asset_id"], 16))
+        return trades
     except Exception as e:
         log.error("Erreur trades: " + str(e))
         return []
-
 def detect_whales(markets):
     whales = []
     for m in markets[:20]:
