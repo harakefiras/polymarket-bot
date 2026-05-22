@@ -20,22 +20,79 @@ pnl_date = date.today()
 open_positions = []
 traded_windows = set()
 
-def get_btc_trend():
+def get_btc_analysis():
     try:
         r = requests.get(
             BINANCE_API + "/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 6},
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 20},
             timeout=10
         )
-        if r.ok:
-            candles = r.json()
-            trend = sum(1 if float(c[4]) > float(c[1]) else -1 for c in candles)
-            last_price = float(candles[-1][4])
-            log.info("BTC: " + str(round(last_price, 0)) + " | Tendance: " + str(trend))
-            return trend, last_price
-        return 0, 0
+        if not r.ok:
+            return 0, 0
+
+        candles = r.json()
+        closes = [float(c[4]) for c in candles]
+        opens = [float(c[1]) for c in candles]
+        volumes = [float(c[5]) for c in candles]
+        last_price = closes[-1]
+
+        # 1. TENDANCE (6 dernieres bougies)
+        trend = sum(1 if closes[i] > opens[i] else -1 for i in range(-6, 0))
+
+        # 2. RSI (14 periodes)
+        gains = []
+        losses = []
+        for i in range(1, len(closes)):
+            diff = closes[i] - closes[i-1]
+            if diff > 0:
+                gains.append(diff)
+                losses.append(0)
+            else:
+                gains.append(0)
+                losses.append(abs(diff))
+        avg_gain = sum(gains[-14:]) / 14
+        avg_loss = sum(losses[-14:]) / 14
+        if avg_loss == 0:
+            rsi = 100
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+
+        # 3. MOYENNE MOBILE (10 vs 5 periodes)
+        ma5  = sum(closes[-5:]) / 5
+        ma10 = sum(closes[-10:]) / 10
+        ma_signal = 1 if ma5 > ma10 else -1
+
+        # 4. VOLUME (dernier volume vs moyenne)
+        avg_volume = sum(volumes[-10:]) / 10
+        vol_signal = 1 if volumes[-1] > avg_volume else 0
+
+        # SCORE FINAL
+        score = 0
+        if trend >= 2:
+            score += 2
+        elif trend <= -2:
+            score -= 2
+
+        if rsi > 55:
+            score += 1
+        elif rsi < 45:
+            score -= 1
+
+        if ma_signal > 0:
+            score += 1
+        else:
+            score -= 1
+
+        if vol_signal:
+            score = score * 1  # confirmation volume
+
+        log.info("BTC: " + str(round(last_price, 0)) + " | RSI: " + str(round(rsi, 1)) + " | MA: " + ("UP" if ma_signal > 0 else "DOWN") + " | Trend: " + str(trend) + " | Score: " + str(score))
+
+        return score, last_price
+
     except Exception as e:
-        log.error("Erreur Binance: " + str(e))
+        log.error("Erreur analyse: " + str(e))
         return 0, 0
 
 def get_btc_market():
@@ -99,7 +156,7 @@ def place_order(token_id, side, price):
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot BTC 5m demarre!")
+    log.info("Bot BTC 5m v3 - RSI + MA + Volume demarre!")
     log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -130,19 +187,26 @@ def run():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            trend, btc_price = get_btc_trend()
+            # Analyse technique
+            score, btc_price = get_btc_analysis()
+
             market, window_ts = get_btc_market()
 
             if not market or window_ts in traded_windows:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if trend >= 0:
+            # Trade seulement si score fort
+            if score >= 2:
                 target = "Up"
-            else:
+                log.info("Signal fort UP (score=" + str(score) + ")")
+            elif score <= -2:
                 target = "Down"
-
-            log.info("Signal: " + target + " (trend=" + str(trend) + ")")
+                log.info("Signal fort DOWN (score=" + str(score) + ")")
+            else:
+                log.info("Signal faible (score=" + str(score) + ") - pas de trade")
+                time.sleep(POLL_INTERVAL)
+                continue
 
             for token in market.get("tokens", []):
                 if token["outcome"] == target:
