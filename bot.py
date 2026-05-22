@@ -5,7 +5,7 @@ PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "50"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "150"))
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "250"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -85,7 +85,7 @@ def get_token_price(token_id):
 
 def place_order(token_id, side, price):
     try:
-        from py_clob_client.clob_types import OrderArgs, PartialCreateOrderConfig
+        from py_clob_client.clob_types import OrderArgs
         size = round(BET_SIZE_USDC / price, 2)
         order_args = OrderArgs(
             token_id=token_id,
@@ -93,7 +93,7 @@ def place_order(token_id, side, price):
             size=size,
             side="BUY",
         )
-        signed = clob_client.create_order(order_args, PartialCreateOrderConfig(neg_risk=False))
+        signed = clob_client.create_order(order_args)
         resp = clob_client.post_order(signed)
         log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
         open_positions.append({"size": BET_SIZE_USDC})
@@ -157,7 +157,7 @@ def run():
                     log.info(target + " @ " + str(round(price, 2)))
                     log.info("Attente 15s avant ordre...")
                     time.sleep(15)
-                    if 0.30 <= price <= 0.80:
+                    if 0.30 <= price <= 0.75:
                         if place_order(token_id, target, price):
                             traded_windows.add(window_ts)
                     else:
