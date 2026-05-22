@@ -2,6 +2,9 @@ import os, time, random, logging, requests, json
 from datetime import date
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
+POLY_API_KEY = os.environ.get("POLY_API_KEY", "")
+POLY_API_SECRET = os.environ.get("POLY_API_SECRET", "")
+POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "50"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "150"))
@@ -24,13 +27,19 @@ clob_client = None
 def init_client():
     global clob_client
     try:
-        from polymarket_apis.clob import ClobClient
+        from py_clob_client_v2 import ApiCreds, ClobClient
+        creds = ApiCreds(
+            api_key=POLY_API_KEY,
+            api_secret=POLY_API_SECRET,
+            api_passphrase=POLY_API_PASSPHRASE,
+        )
         clob_client = ClobClient(
             host=CLOB_API,
-            private_key=PRIVATE_KEY,
-            chain_id=CHAIN_ID
+            chain_id=CHAIN_ID,
+            key=PRIVATE_KEY,
+            creds=creds
         )
-        log.info("Client Polymarket initialise!")
+        log.info("Client Polymarket v2 initialise!")
         return True
     except Exception as e:
         log.error("Erreur init client: " + str(e))
@@ -87,13 +96,17 @@ def get_token_price(token_id):
 
 def place_order(token_id, side, price):
     try:
+        from py_clob_client_v2 import OrderArgs, OrderType, Side, PartialCreateOrderOptions
         size = round(BET_SIZE_USDC / price, 2)
-        resp = clob_client.post_order(
+        order_args = OrderArgs(
             token_id=token_id,
-            side="BUY",
             price=round(price, 4),
             size=size,
+            side=Side.BUY,
         )
+        opts = PartialCreateOrderOptions(neg_risk=False)
+        signed = clob_client.create_order(order_args, opts)
+        resp = clob_client.post_order(signed, OrderType.GTC)
         log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
         open_positions.append({"size": BET_SIZE_USDC})
         return True
@@ -103,7 +116,7 @@ def place_order(token_id, side, price):
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot BTC 5m demarre!")
+    log.info("Bot BTC 5m v2 demarre!")
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
