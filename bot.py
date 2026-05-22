@@ -359,4 +359,4 @@ def run():
         time.sleep(wait)
 
 if __name__ == "__main__":
-    run()
+    log.info("Bot en pause")
