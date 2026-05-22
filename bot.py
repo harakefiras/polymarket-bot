@@ -7,6 +7,8 @@ BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "50"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "150"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "250"))
+TAKE_PROFIT = float(os.getenv("TAKE_PROFIT", "0.80"))
+STOP_PER_TRADE = float(os.getenv("STOP_PER_TRADE", "0.25"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -29,17 +31,14 @@ def get_btc_analysis():
         )
         if not r.ok:
             return 0, 0
-
         candles = r.json()
         closes = [float(c[4]) for c in candles]
         opens = [float(c[1]) for c in candles]
         volumes = [float(c[5]) for c in candles]
         last_price = closes[-1]
 
-        # 1. TENDANCE (6 dernieres bougies)
         trend = sum(1 if closes[i] > opens[i] else -1 for i in range(-6, 0))
 
-        # 2. RSI (14 periodes)
         gains = []
         losses = []
         for i in range(1, len(closes)):
@@ -58,37 +57,28 @@ def get_btc_analysis():
             rs = avg_gain / avg_loss
             rsi = 100 - (100 / (1 + rs))
 
-        # 3. MOYENNE MOBILE (10 vs 5 periodes)
-        ma5  = sum(closes[-5:]) / 5
+        ma5 = sum(closes[-5:]) / 5
         ma10 = sum(closes[-10:]) / 10
         ma_signal = 1 if ma5 > ma10 else -1
 
-        # 4. VOLUME (dernier volume vs moyenne)
         avg_volume = sum(volumes[-10:]) / 10
-        vol_signal = 1 if volumes[-1] > avg_volume else 0
+        vol_confirm = volumes[-1] > avg_volume
 
-        # SCORE FINAL
         score = 0
         if trend >= 2:
             score += 2
         elif trend <= -2:
             score -= 2
-
         if rsi > 55:
             score += 1
         elif rsi < 45:
             score -= 1
-
         if ma_signal > 0:
             score += 1
         else:
             score -= 1
 
-        if vol_signal:
-            score = score * 1  # confirmation volume
-
         log.info("BTC: " + str(round(last_price, 0)) + " | RSI: " + str(round(rsi, 1)) + " | MA: " + ("UP" if ma_signal > 0 else "DOWN") + " | Trend: " + str(trend) + " | Score: " + str(score))
-
         return score, last_price
 
     except Exception as e:
@@ -110,7 +100,6 @@ def get_btc_market():
                 token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
                 tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
                 market["tokens"] = tokens
-                log.info("Tokens: " + str([(t["outcome"], t["token_id"][:10]) for t in tokens]))
                 return market, window_ts
         return None, None
     except Exception as e:
@@ -125,6 +114,32 @@ def get_token_price(token_id):
         return 0
     except:
         return 0
+
+async def sell_position_async(token_id, size, reason):
+    try:
+        from polymarket import AsyncSecureClient
+        async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=WALLET,
+        ) as client:
+            response = await client.place_limit_order(
+                token_id=token_id,
+                side="SELL",
+                price="0.95",
+                size=str(size),
+            )
+            if response.ok:
+                log.info("VENDU (" + reason + ") token=" + token_id[:10] + " | order_id=" + str(response.order_id))
+                return True
+            else:
+                log.error("Erreur vente: " + str(response.code))
+                return False
+    except Exception as e:
+        log.error("Exception vente: " + str(e))
+        return False
+
+def sell_position(token_id, size, reason):
+    return asyncio.run(sell_position_async(token_id, size, reason))
 
 async def place_order_async(token_id, side, price):
     try:
@@ -142,7 +157,12 @@ async def place_order_async(token_id, side, price):
             )
             if response.ok:
                 log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | order_id=" + str(response.order_id))
-                open_positions.append({"size": BET_SIZE_USDC})
+                open_positions.append({
+                    "size": BET_SIZE_USDC,
+                    "token_id": token_id,
+                    "entry_price": price,
+                    "shares": round(BET_SIZE_USDC / price, 2),
+                })
                 return True
             else:
                 log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -154,15 +174,50 @@ async def place_order_async(token_id, side, price):
 def place_order(token_id, side, price):
     return asyncio.run(place_order_async(token_id, side, price))
 
+def monitor_positions():
+    global open_positions, daily_pnl
+    if not open_positions:
+        return
+    positions_to_remove = []
+    for pos in open_positions:
+        token_id = pos.get("token_id")
+        if not token_id:
+            continue
+        current_price = get_token_price(token_id)
+        if current_price <= 0:
+            continue
+        entry = pos.get("entry_price", 0.5)
+        shares = pos.get("shares", 0)
+        log.info("Position " + token_id[:10] + " | Entry: " + str(round(entry, 2)) + " | Current: " + str(round(current_price, 2)))
+
+        if current_price >= TAKE_PROFIT:
+            log.info("TAKE PROFIT @ " + str(current_price))
+            if sell_position(token_id, shares, "TAKE_PROFIT"):
+                pnl = (current_price - entry) * shares
+                daily_pnl += pnl
+                log.info("PnL position: +" + str(round(pnl, 2)) + " USDC")
+                positions_to_remove.append(pos)
+
+        elif current_price <= STOP_PER_TRADE:
+            log.info("STOP LOSS POSITION @ " + str(current_price))
+            if sell_position(token_id, shares, "STOP_LOSS"):
+                pnl = (current_price - entry) * shares
+                daily_pnl += pnl
+                log.info("PnL position: " + str(round(pnl, 2)) + " USDC")
+                positions_to_remove.append(pos)
+
+    for pos in positions_to_remove:
+        if pos in open_positions:
+            open_positions.remove(pos)
+
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot BTC 5m v3 - RSI + MA + Volume demarre!")
-    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("Bot BTC 5m v4 - TP/SL + RSI + MA demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " | Take Profit: " + str(TAKE_PROFIT) + " | Stop/trade: " + str(STOP_PER_TRADE))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
         return
-
     if not WALLET.startswith("0x"):
         log.error("POLYMARKET_WALLET_ADDRESS manquante!")
         return
@@ -177,26 +232,25 @@ def run():
                 traded_windows.clear()
 
             if daily_pnl <= -STOP_LOSS_USDC:
-                log.warning("Stop-loss atteint! Pause 1h.")
+                log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
                 continue
+
+            monitor_positions()
 
             open_val = sum(p["size"] for p in open_positions)
             if open_val >= MAX_OPEN_USDC:
                 log.info("Plafond atteint - attente...")
-                time.sleep(POLL_INTERVAL)
+                time.sleep(60)
                 continue
 
-            # Analyse technique
             score, btc_price = get_btc_analysis()
-
             market, window_ts = get_btc_market()
 
             if not market or window_ts in traded_windows:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Trade seulement si score fort
             if score >= 2:
                 target = "Up"
                 log.info("Signal fort UP (score=" + str(score) + ")")
