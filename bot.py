@@ -23,7 +23,7 @@ def get_btc_markets():
     try:
         r = requests.get(
             GAMMA_API + "/markets",
-            params={"active": "true", "limit": 100, "tag": "bitcoin"},
+            params={"active": "true", "limit": 100},
             timeout=10
         )
         if r.ok:
