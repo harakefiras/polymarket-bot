@@ -1,4 +1,3 @@
-
 import os, time, random, logging, requests
 from datetime import date
 
@@ -25,12 +24,15 @@ def get_btc_markets():
         now = int(t.time())
         window_ts = now - (now % 300)
         slug = "btc-updown-5m-" + str(window_ts)
-        r = requests.get(GAMMA_API + "/events", params={"slug": slug}, timeout=10)
+        log.info("Cherche slug: " + slug)
+        r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
         if r.ok:
             data = r.json()
-            markets = data.get("markets", []) if isinstance(data, dict) else []
-            log.info("Marches BTC 5m trouves: " + str(len(markets)))
-            return markets
+            if isinstance(data, list):
+                log.info("Marches BTC 5m trouves: " + str(len(data)))
+                return data
+            elif isinstance(data, dict):
+                return [data]
         return []
     except Exception as e:
         log.error("Erreur marches: " + str(e))
