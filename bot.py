@@ -24,10 +24,12 @@ clob_client = None
 def init_client():
     global clob_client
     try:
-        from py_clob_client.client import ClobClient
-        clob_client = ClobClient(CLOB_API, key=PRIVATE_KEY, chain_id=CHAIN_ID)
-        creds = clob_client.create_or_derive_api_creds()
-        clob_client.set_api_creds(creds)
+        from polymarket_apis.clob import ClobClient
+        clob_client = ClobClient(
+            host=CLOB_API,
+            private_key=PRIVATE_KEY,
+            chain_id=CHAIN_ID
+        )
         log.info("Client Polymarket initialise!")
         return True
     except Exception as e:
@@ -85,16 +87,13 @@ def get_token_price(token_id):
 
 def place_order(token_id, side, price):
     try:
-        from py_clob_client.clob_types import OrderArgs
         size = round(BET_SIZE_USDC / price, 2)
-        order_args = OrderArgs(
+        resp = clob_client.post_order(
             token_id=token_id,
+            side="BUY",
             price=round(price, 4),
             size=size,
-            side="BUY",
         )
-        signed = clob_client.create_order(order_args)
-        resp = clob_client.post_order(signed)
         log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
         open_positions.append({"size": BET_SIZE_USDC})
         return True
