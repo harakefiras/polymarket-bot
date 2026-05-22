@@ -22,6 +22,7 @@ daily_pnl = 0.0
 pnl_date = date.today()
 seen_trades = set()
 traded_windows = set()
+traded_markets = set()
 open_positions = []
 
 def check_stop_loss():
@@ -48,10 +49,11 @@ def get_recent_trades(market_id):
 
 def detect_whales(markets):
     whales = []
+    seen_market_tokens = set()
     for m in markets[:20]:
         mid = m.get("conditionId") or m.get("id")
         question = m.get("question", "?")
-        if not mid:
+        if not mid or mid in traded_markets:
             continue
         trades = get_recent_trades(mid)
         if not isinstance(trades, list):
@@ -65,15 +67,21 @@ def detect_whales(markets):
             notional = size * price
             token_id = str(t.get("asset", ""))
             outcome = t.get("outcome", "Yes")
+            market_key = mid + "_" + outcome
+            if market_key in seen_market_tokens:
+                continue
             if notional >= MIN_WHALE_USDC and 0.30 <= price <= 0.70 and token_id:
                 whales.append({
                     "id": tid,
+                    "market_id": mid,
                     "market": question,
                     "token_id": token_id,
                     "price": price,
                     "notional": notional,
-                    "outcome": outcome
+                    "outcome": outcome,
+                    "market_key": market_key
                 })
+                seen_market_tokens.add(market_key)
     return whales
 
 def get_btc_analysis():
@@ -151,7 +159,7 @@ def get_token_price(token_id):
     except:
         return 0
 
-async def sell_order_async(token_id, shares, reason):
+async def sell_order_async(token_id, shares, reason, price):
     try:
         from polymarket import AsyncSecureClient
         async with await AsyncSecureClient.create(
@@ -161,11 +169,11 @@ async def sell_order_async(token_id, shares, reason):
             response = await client.place_limit_order(
                 token_id=token_id,
                 side="SELL",
-                price=str(TAKE_PROFIT_PRICE if reason == "TP" else STOP_LOSS_PRICE),
+                price=str(round(price, 4)),
                 size=str(round(shares, 2)),
             )
             if response.ok:
-                log.info("VENTE " + reason + " | order_id=" + str(response.order_id))
+                log.info("VENTE " + reason + " @ " + str(round(price, 2)) + " | order_id=" + str(response.order_id))
                 return True
             else:
                 log.error("Erreur vente: " + str(response.message))
@@ -174,11 +182,10 @@ async def sell_order_async(token_id, shares, reason):
         log.error("Exception vente: " + str(e))
         return False
 
-def sell_order(token_id, shares, reason):
-    return asyncio.run(sell_order_async(token_id, shares, reason))
+def sell_order(token_id, shares, reason, price):
+    return asyncio.run(sell_order_async(token_id, shares, reason, price))
 
 async def place_order_async(token_id, outcome, price):
-    global daily_pnl
     try:
         from polymarket import AsyncSecureClient
         shares = round(BET_SIZE_USDC / price, 2)
@@ -225,16 +232,16 @@ def monitor_positions():
         log.info("Position " + pos["outcome"] + " | Entry: " + str(round(entry, 2)) + " | Current: " + str(round(current, 2)))
 
         if current >= TAKE_PROFIT_PRICE:
-            log.info("TAKE PROFIT! " + str(round(current, 2)))
-            if sell_order(token_id, shares, "TP"):
+            log.info("TAKE PROFIT! @ " + str(round(current, 2)))
+            if sell_order(token_id, shares, "TP", current):
                 pnl = (current - entry) * shares
                 daily_pnl += pnl
                 log.info("PnL: +" + str(round(pnl, 2)) + " USDC")
                 to_remove.append(pos)
 
         elif current <= STOP_LOSS_PRICE:
-            log.info("STOP LOSS! " + str(round(current, 2)))
-            if sell_order(token_id, shares, "SL"):
+            log.info("STOP LOSS! @ " + str(round(current, 2)))
+            if sell_order(token_id, shares, "SL", current):
                 pnl = (current - entry) * shares
                 daily_pnl += pnl
                 log.info("PnL: " + str(round(pnl, 2)) + " USDC")
@@ -246,7 +253,7 @@ def monitor_positions():
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Dual Strategy + TP/SL demarre!")
+    log.info("Bot Dual Strategy v2 + TP/SL + Anti-doublon demarre!")
     log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss jour: " + str(STOP_LOSS_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL/trade: " + str(STOP_LOSS_PRICE))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -265,13 +272,13 @@ def run():
                 pnl_date = today
                 seen_trades.clear()
                 traded_windows.clear()
+                traded_markets.clear()
 
             if check_stop_loss():
                 log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
                 continue
 
-            # Surveille les positions ouvertes
             monitor_positions()
 
             # ─── STRATEGIE 1 : Copy Whales ───────────────────────
@@ -279,7 +286,7 @@ def run():
             markets = get_active_markets()
             whales = detect_whales(markets)
             if whales:
-                log.info(str(len(whales)) + " whale(s)!")
+                log.info(str(len(whales)) + " whale(s) unique(s)!")
                 for w in whales:
                     if check_stop_loss():
                         break
@@ -291,6 +298,7 @@ def run():
                     if 0.30 <= price <= 0.70:
                         if place_order(w["token_id"], w["outcome"], price):
                             seen_trades.add(w["id"])
+                            traded_markets.add(w["market_id"])
                     else:
                         log.info("Prix hors fourchette: " + str(round(price, 2)))
             else:
