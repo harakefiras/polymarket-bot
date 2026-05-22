@@ -1,10 +1,8 @@
-import os, time, random, logging, requests, json
+import os, time, random, logging, requests, json, asyncio
 from datetime import date
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
-POLY_API_KEY = os.environ.get("POLY_API_KEY", "")
-POLY_API_SECRET = os.environ.get("POLY_API_SECRET", "")
-POLY_API_PASSPHRASE = os.environ.get("POLY_API_PASSPHRASE", "")
+WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "50"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "150"))
@@ -13,7 +11,6 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "250"))
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 BINANCE_API = "https://api.binance.com"
-CHAIN_ID = 137
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
@@ -22,28 +19,6 @@ daily_pnl = 0.0
 pnl_date = date.today()
 open_positions = []
 traded_windows = set()
-clob_client = None
-
-def init_client():
-    global clob_client
-    try:
-        from py_clob_client_v2 import ApiCreds, ClobClient
-        creds = ApiCreds(
-            api_key=POLY_API_KEY,
-            api_secret=POLY_API_SECRET,
-            api_passphrase=POLY_API_PASSPHRASE,
-        )
-        clob_client = ClobClient(
-            host=CLOB_API,
-            chain_id=CHAIN_ID,
-            key=PRIVATE_KEY,
-            creds=creds
-        )
-        log.info("Client Polymarket v2 initialise!")
-        return True
-    except Exception as e:
-        log.error("Erreur init client: " + str(e))
-        return False
 
 def get_btc_trend():
     try:
@@ -94,36 +69,45 @@ def get_token_price(token_id):
     except:
         return 0
 
-def place_order(token_id, side, price):
+async def place_order_async(token_id, side, price):
     try:
-        from py_clob_client_v2 import OrderArgs, OrderType, Side, PartialCreateOrderOptions
-        size = round(BET_SIZE_USDC / price, 2)
-        order_args = OrderArgs(
-            token_id=token_id,
-            price=round(price, 4),
-            size=size,
-            side=Side.BUY,
-        )
-        opts = PartialCreateOrderOptions(neg_risk=False)
-        signed = clob_client.create_order(order_args, opts)
-        resp = clob_client.post_order(signed, OrderType.GTC)
-        log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
-        open_positions.append({"size": BET_SIZE_USDC})
-        return True
+        from polymarket import AsyncSecureClient
+        size = str(round(BET_SIZE_USDC / price, 2))
+        async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=WALLET,
+        ) as client:
+            response = await client.place_limit_order(
+                token_id=token_id,
+                side="BUY",
+                price=str(round(price, 4)),
+                size=size,
+            )
+            if response.ok:
+                log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | order_id=" + str(response.order_id))
+                open_positions.append({"size": BET_SIZE_USDC})
+                return True
+            else:
+                log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
+                return False
     except Exception as e:
-        log.error("Erreur ordre: " + str(e))
+        log.error("Exception ordre: " + str(e))
         return False
+
+def place_order(token_id, side, price):
+    return asyncio.run(place_order_async(token_id, side, price))
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot BTC 5m v2 demarre!")
+    log.info("Bot BTC 5m demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
         return
 
-    if not init_client():
-        log.error("Impossible initialiser client!")
+    if not WALLET.startswith("0x"):
+        log.error("POLYMARKET_WALLET_ADDRESS manquante!")
         return
 
     while True:
