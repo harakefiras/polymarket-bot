@@ -92,6 +92,8 @@ def place_order(token_id, side, price):
             price=round(price, 4),
             size=size,
             side="BUY",
+            fee_rate_bps=0,
+            nonce=0,
         )
         resp = clob_client.create_and_post_order(order_args)
         log.info("TRADE " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price, 2)) + " | " + str(resp))
