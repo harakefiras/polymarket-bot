@@ -1,5 +1,5 @@
 import os, time, random, logging, requests, json, asyncio
-from datetime import date
+from datetime import date, datetime
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
@@ -10,6 +10,7 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
 TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.80"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
+MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "48"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -34,8 +35,25 @@ def open_val():
 
 def get_active_markets():
     try:
-        r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 20}, timeout=10)
-        return r.json() if r.ok else []
+        r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 50}, timeout=10)
+        if not r.ok:
+            return []
+        markets = r.json()
+        filtered = []
+        now = datetime.utcnow()
+        for m in markets:
+            end_date = m.get("endDateIso") or m.get("endDate")
+            if not end_date:
+                continue
+            try:
+                end = datetime.fromisoformat(end_date.replace("Z", ""))
+                hours_left = (end - now).total_seconds() / 3600
+                if 0 < hours_left <= MAX_MARKET_HOURS:
+                    filtered.append(m)
+            except:
+                continue
+        log.info("Marches < " + str(int(MAX_MARKET_HOURS)) + "h: " + str(len(filtered)))
+        return filtered
     except Exception as e:
         log.error("Erreur marches: " + str(e))
         return []
@@ -54,7 +72,7 @@ def get_recent_trades(market_id):
 def detect_whales(markets):
     whales = []
     seen_market_tokens = set()
-    for m in markets[:20]:
+    for m in markets:
         mid = m.get("conditionId") or m.get("id")
         question = m.get("question", "?")
         if not mid or mid in traded_markets:
@@ -74,7 +92,7 @@ def detect_whales(markets):
             market_key = mid + "_" + outcome
             if market_key in seen_market_tokens:
                 continue
-            if notional >= MIN_WHALE_USDC and 0.30 <= price <= 0.70 and token_id:
+            if notional >= MIN_WHALE_USDC and 0.45 <= price <= 0.70 and token_id:
                 whales.append({
                     "id": tid,
                     "market_id": mid,
@@ -257,8 +275,9 @@ def monitor_positions():
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Dual Strategy v3 demarre!")
-    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL: " + str(STOP_LOSS_PRICE))
+    log.info("Bot Final v1 demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("Whale min: " + str(MIN_WHALE_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL: " + str(STOP_LOSS_PRICE) + " | Max heures marche: " + str(MAX_MARKET_HOURS))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -293,19 +312,19 @@ def run():
                 markets = get_active_markets()
                 whales = detect_whales(markets)
                 if whales:
-                    log.info(str(len(whales)) + " whale(s) unique(s)!")
+                    log.info(str(len(whales)) + " whale(s)!")
                     for w in whales:
                         if check_stop_loss():
                             break
                         if open_val() + BET_SIZE_USDC > MAX_OPEN_USDC:
-                            log.info("Plafond atteint - stop mises")
+                            log.info("Plafond atteint")
                             break
                         log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
                         time.sleep(5)
                         price = get_token_price(w["token_id"])
                         if price <= 0:
                             price = w["price"]
-                        if 0.30 <= price <= 0.70:
+                        if 0.45 <= price <= 0.70:
                             if place_order(w["token_id"], w["outcome"], price):
                                 seen_trades.add(w["id"])
                                 traded_markets.add(w["market_id"])
@@ -314,7 +333,7 @@ def run():
                 else:
                     log.info("Aucune whale")
             else:
-                log.info("Plafond atteint - pas de nouvelles mises whales")
+                log.info("Plafond atteint - pas de mises")
 
             if check_stop_loss():
                 continue
@@ -326,9 +345,9 @@ def run():
                 market, window_ts = get_btc_market()
 
                 if market and window_ts not in traded_windows:
-                    if score >= 3:
+                    if score >= 2:
                         target = "Up"
-                    elif score <= -3:
+                    elif score <= -2:
                         target = "Down"
                     else:
                         target = None
@@ -343,7 +362,7 @@ def run():
                                     price = 0.5
                                 log.info(target + " @ " + str(round(price, 2)))
                                 time.sleep(15)
-                                if 0.40 <= price <= 0.65:
+                                if 0.45 <= price <= 0.65:
                                     if place_order(token_id, target, price):
                                         traded_windows.add(window_ts)
                                 else:
@@ -359,4 +378,4 @@ def run():
         time.sleep(wait)
 
 if __name__ == "__main__":
-    log.info("Bot en pause")
+    run()
