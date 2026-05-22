@@ -154,6 +154,8 @@ def run():
                     if price <= 0:
                         price = 0.5
                     log.info(target + " @ " + str(round(price, 2)))
+                    log.info("Attente 15s avant ordre...")
+                    time.sleep(15)
                     if 0.30 <= price <= 0.80:
                         if place_order(token_id, target, price):
                             traded_windows.add(window_ts)
