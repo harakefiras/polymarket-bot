@@ -1,14 +1,12 @@
+
 import os, time, random, logging, requests
 from datetime import date
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
-MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "500"))
 BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "10"))
-MIN_PROB = float(os.getenv("MIN_PROB", "0.20"))
-COPY_DELAY_S = float(os.getenv("COPY_DELAY_S", "5"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "50"))
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "60"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "150"))
+POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "60"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -18,64 +16,129 @@ log = logging.getLogger("bot")
 
 daily_pnl = 0.0
 pnl_date = date.today()
-seen_trades = set()
 open_positions = []
+traded_markets = set()
 
-def get_markets():
+def get_btc_markets():
     try:
-        r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 20}, timeout=10)
-        return r.json() if r.ok else []
+        r = requests.get(
+            GAMMA_API + "/markets",
+            params={"active": "true", "limit": 100, "tag": "bitcoin"},
+            timeout=10
+        )
+        if r.ok:
+            all_markets = r.json()
+            btc5m = [m for m in all_markets if "5m" in m.get("slug","").lower() or "5m" in m.get("question","").lower() or "updown" in m.get("slug","").lower()]
+            log.info("Marches BTC 5m trouves: " + str(len(btc5m)))
+            return btc5m
+        return []
     except Exception as e:
         log.error("Erreur marches: " + str(e))
         return []
 
-def get_trades(market_id):
+def get_market_orderbook(token_id):
     try:
-        r = requests.get(CLOB_API + "/trades", params={"market": market_id, "limit": 20}, timeout=10)
-        return r.json().get("data", []) if r.ok else []
+        r = requests.get(
+            CLOB_API + "/book",
+            params={"token_id": token_id},
+            timeout=10
+        )
+        if r.ok:
+            return r.json()
+        return None
     except Exception as e:
-        log.error("Erreur trades: " + str(e))
-        return []
+        log.error("Erreur orderbook: " + str(e))
+        return None
 
-def open_value():
-    return sum(p["size"] for p in open_positions)
+def get_market_last_trade_price(token_id):
+    try:
+        r = requests.get(
+            CLOB_API + "/last-trade-price",
+            params={"token_id": token_id},
+            timeout=10
+        )
+        if r.ok:
+            return float(r.json().get("price", 0))
+        return 0
+    except:
+        return 0
 
-def detect_whales(markets):
-    whales = []
-    for m in markets[:20]:
-        mid = m.get("conditionId") or m.get("id")
-        if not mid:
-            continue
-        for t in get_trades(mid):
-            tid = t.get("id")
-            if tid in seen_trades:
-                continue
-            size = float(t.get("size", 0))
-            price = float(t.get("price", 0.5))
-            notional = size * price
-            if notional >= MIN_WHALE_USDC and MIN_PROB <= price <= (1 - MIN_PROB):
-                whales.append({"id": tid, "market": m.get("question", "?"), "token_id": mid, "price": price, "notional": notional})
-    return whales
-
-def place_order(trade):
+def place_order(market, token_id, side, price):
     try:
         from eth_account import Account
         account = Account.from_key(PRIVATE_KEY)
-        order = {"market": trade["token_id"], "side": "BUY", "price": round(trade["price"], 4), "size": round(BET_SIZE_USDC / trade["price"], 2), "type": "GTC"}
-        r = requests.post(CLOB_API + "/order", json=order, headers={"POLY_ADDRESS": account.address}, timeout=10)
+        size = round(BET_SIZE_USDC / price, 2)
+        order = {
+            "market": token_id,
+            "side": side,
+            "price": round(price, 4),
+            "size": size,
+            "type": "GTC"
+        }
+        r = requests.post(
+            CLOB_API + "/order",
+            json=order,
+            headers={"POLY_ADDRESS": account.address},
+            timeout=10
+        )
         if r.ok:
-            log.info("Trade copie: " + str(BET_SIZE_USDC) + " USDC sur " + trade["market"])
-            seen_trades.add(trade["id"])
-            open_positions.append({"id": trade["id"], "size": BET_SIZE_USDC})
+            log.info("Trade place: " + side + " " + str(BET_SIZE_USDC) + " USDC @ " + str(round(price,2)) + " sur " + market)
+            open_positions.append({"size": BET_SIZE_USDC})
+            traded_markets.add(token_id)
+            return True
         else:
             log.error("Erreur ordre: " + str(r.status_code) + " " + r.text[:100])
+            return False
     except Exception as e:
         log.error("Exception ordre: " + str(e))
+        return False
+
+def analyze_and_trade(market):
+    try:
+        tokens = market.get("tokens", [])
+        if not tokens:
+            return
+
+        question = market.get("question", "?")
+        market_id = market.get("conditionId", "")
+
+        for token in tokens:
+            token_id = token.get("token_id", "")
+            outcome = token.get("outcome", "")
+
+            if token_id in traded_markets:
+                continue
+
+            price = get_market_last_trade_price(token_id)
+            if price <= 0:
+                price = float(token.get("price", 0))
+
+            if price <= 0:
+                continue
+
+            log.info("BTC 5m - " + outcome + " @ " + str(round(price, 2)) + " | " + question)
+
+            # Strategie: miser sur UP si prix < 0.55 (favorable)
+            if outcome.upper() in ["UP", "YES"] and 0.30 <= price <= 0.65:
+                log.info("Signal UP detecte @ " + str(round(price, 2)))
+                open_val = sum(p["size"] for p in open_positions)
+                if open_val + BET_SIZE_USDC <= MAX_OPEN_USDC:
+                    place_order(question, token_id, "BUY", price)
+                else:
+                    log.info("Plafond atteint")
+
+    except Exception as e:
+        log.error("Erreur analyse: " + str(e))
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot demarre!")
-    log.info("Whale min: " + str(MIN_WHALE_USDC) + " | Mise: " + str(BET_SIZE_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("Bot BTC 5m demarre!")
+    log.info("Mise: " + str(BET_SIZE_USDC) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+
+    if not PRIVATE_KEY.startswith("0x"):
+        log.error("PRIVATE_KEY manquante!")
+        return
+
     while True:
         try:
             today = date.today()
@@ -83,33 +146,31 @@ def run():
                 log.info("Nouveau jour - PnL: " + str(round(daily_pnl, 2)))
                 daily_pnl = 0.0
                 pnl_date = today
+                traded_markets.clear()
+
             if daily_pnl <= -STOP_LOSS_USDC:
                 log.warning("Stop-loss atteint! Pause 1h.")
                 time.sleep(3600)
                 continue
-            val = open_value()
-            log.info("Positions ouvertes: " + str(round(val, 2)) + "/" + str(MAX_OPEN_USDC) + " USDC")
-            if val >= MAX_OPEN_USDC:
-                log.info("Plafond atteint - attente retours...")
+
+            open_val = sum(p["size"] for p in open_positions)
+            log.info("Positions: " + str(round(open_val, 2)) + "/" + str(MAX_OPEN_USDC) + " USDC")
+
+            if open_val >= MAX_OPEN_USDC:
+                log.info("Plafond atteint - attente...")
                 time.sleep(POLL_INTERVAL)
                 continue
-            log.info("Scan en cours...")
-            markets = get_markets()
-            log.info("Marches trouves: " + str(len(markets)))
-            whales = detect_whales(markets)
-            if whales:
-                log.info(str(len(whales)) + " whale(s) detectee(s)!")
-                for w in whales:
-                    if open_value() + BET_SIZE_USDC > MAX_OPEN_USDC:
-                        log.info("Plafond atteint - stop mises")
-                        break
-                    log.info("Whale: " + str(round(w["notional"])) + " USDC sur " + w["market"])
-                    time.sleep(COPY_DELAY_S)
-                    place_order(w)
+
+            markets = get_btc_markets()
+            if not markets:
+                log.info("Aucun marche BTC 5m actif")
             else:
-                log.info("Aucune whale detectee")
+                for m in markets:
+                    analyze_and_trade(m)
+
         except Exception as e:
-            log.error("Erreur: " + str(e))
+            log.error("Erreur boucle: " + str(e))
+
         wait = POLL_INTERVAL + random.uniform(0, 10)
         log.info("Prochain scan dans " + str(int(wait)) + "s")
         time.sleep(wait)
