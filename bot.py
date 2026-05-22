@@ -85,13 +85,13 @@ def get_token_price(token_id):
 
 def place_order(token_id, side, price):
     try:
-        from py_clob_client.clob_types import OrderArgs, OrderType, Side
+        from py_clob_client.clob_types import OrderArgs, OrderType
         size = round(BET_SIZE_USDC / price, 2)
         order_args = OrderArgs(
             token_id=token_id,
             price=round(price, 4),
             size=size,
-            side=Side.BUY,
+            side="BUY",
             order_type=OrderType.GTC,
         )
         resp = clob_client.create_and_post_order(order_args)
@@ -111,7 +111,7 @@ def run():
         return
 
     if not init_client():
-        log.error("Impossible d'initialiser le client Polymarket!")
+        log.error("Impossible initialiser client!")
         return
 
     while True:
@@ -155,7 +155,7 @@ def run():
                     if price <= 0:
                         price = 0.5
                     log.info(target + " @ " + str(round(price, 2)))
-                    if 0.35 <= price <= 0.75:
+                    if 0.30 <= price <= 0.80:
                         if place_order(token_id, target, price):
                             traded_windows.add(window_ts)
                     else:
