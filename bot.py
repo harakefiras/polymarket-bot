@@ -31,23 +31,15 @@ def get_active_markets():
 
 def get_recent_trades(market_id):
     try:
-        r = requests.get(
-            DATA_API + "/trades",
-            params={"market": market_id, "limit": 20},
-            timeout=10
-        )
+        r = requests.get(DATA_API + "/trades", params={"market": market_id, "limit": 20}, timeout=10)
         if not r.ok:
             return []
         trades = r.json()
-        if not isinstance(trades, list):
-            return []
-        for t in trades:
-            if "asset_id" in t and t["asset_id"].startswith("0x"):
-                t["asset_id"] = str(int(t["asset_id"], 16))
-        return trades
+        return trades if isinstance(trades, list) else []
     except Exception as e:
         log.error("Erreur trades: " + str(e))
         return []
+
 def detect_whales(markets):
     whales = []
     for m in markets[:20]:
@@ -65,11 +57,16 @@ def detect_whales(markets):
             size = float(t.get("size", 0))
             price = float(t.get("price", 0.5))
             notional = size * price
+            asset_id = t.get("asset_id", "")
+            if asset_id.startswith("0x"):
+                token_id = str(int(asset_id, 16))
+            else:
+                token_id = asset_id
             if notional >= MIN_WHALE_USDC and 0.20 <= price <= 0.80:
                 whales.append({
                     "id": tid,
                     "market": question,
-                    "token_id": t.get("asset_id", mid),
+                    "token_id": token_id,
                     "price": price,
                     "notional": notional,
                     "outcome": t.get("outcome", "YES")
@@ -115,7 +112,7 @@ def place_order(token_id, outcome, price):
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Copy Whales demarre!")
+    log.info("Bot Copy Whales v2 demarre!")
     log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | Whale min: " + str(MIN_WHALE_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
