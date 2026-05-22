@@ -42,14 +42,15 @@ def get_recent_trades(market_id):
 
 def detect_whales(markets):
     whales = []
-    for m in markets[:20]:
+    for m in markets[:5]:
         mid = m.get("conditionId") or m.get("id")
         question = m.get("question", "?")
         if not mid:
             continue
         trades = get_recent_trades(mid)
-        if not isinstance(trades, list):
+        if not isinstance(trades, list) or not trades:
             continue
+        log.info("Exemple trade: " + str(trades[0]))
         for t in trades:
             tid = t.get("id") or t.get("transactionHash")
             if not tid or tid in seen_trades:
@@ -57,12 +58,13 @@ def detect_whales(markets):
             size = float(t.get("size", 0))
             price = float(t.get("price", 0.5))
             notional = size * price
-            asset_id = t.get("asset_id", "")
+            asset_id = t.get("asset_id") or t.get("tokenId") or t.get("token_id") or t.get("outcomeIndex") or ""
+            asset_id = str(asset_id)
             if asset_id.startswith("0x"):
                 token_id = str(int(asset_id, 16))
             else:
                 token_id = asset_id
-            if notional >= MIN_WHALE_USDC and 0.20 <= price <= 0.80:
+            if notional >= MIN_WHALE_USDC and 0.20 <= price <= 0.80 and token_id:
                 whales.append({
                     "id": tid,
                     "market": question,
@@ -112,7 +114,7 @@ def place_order(token_id, outcome, price):
 
 def run():
     global daily_pnl, pnl_date
-    log.info("Bot Copy Whales v2 demarre!")
+    log.info("Bot Copy Whales v3 demarre!")
     log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | Whale min: " + str(MIN_WHALE_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
