@@ -154,10 +154,10 @@ def run():
                 continue
 
             # Decide UP ou DOWN selon tendance
-            if trend >= 1:
+            if trend >= 0:
                 target_outcome = "UP"
                 log.info("Signal: UP (tendance haussiere " + str(trend) + ")")
-            elif trend <= -1:
+            elif trend < 0:
                 target_outcome = "DOWN"
                 log.info("Signal: DOWN (tendance baissiere " + str(trend) + ")")
             else:
