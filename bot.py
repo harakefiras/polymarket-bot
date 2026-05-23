@@ -1,5 +1,6 @@
 import os, time, random, logging, requests, json, asyncio
 from datetime import date, datetime, timezone
+import threading
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
@@ -11,6 +12,7 @@ TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.80"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
 MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
+MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -28,6 +30,7 @@ pnl_date = date.today()
 seen_trades = set()
 traded_windows = set()
 open_positions = []
+positions_lock = threading.Lock()
 
 def load_traded_markets():
     try:
@@ -51,7 +54,8 @@ def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
 
 def open_val():
-    return sum(p["size"] for p in open_positions)
+    with positions_lock:
+        return sum(p["size"] for p in open_positions)
 
 def calculate_bet_size(slope):
     abs_slope = abs(slope)
@@ -240,15 +244,16 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
             )
             if response.ok:
                 log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC: " + str(round(btc_entry)))
-                open_positions.append({
-                    "token_id": token_id,
-                    "entry_price": price,
-                    "shares": shares,
-                    "size": bet_size,
-                    "outcome": outcome,
-                    "btc_entry": btc_entry,
-                    "side": outcome,
-                })
+                with positions_lock:
+                    open_positions.append({
+                        "token_id": token_id,
+                        "entry_price": price,
+                        "shares": shares,
+                        "size": bet_size,
+                        "outcome": outcome,
+                        "btc_entry": btc_entry,
+                        "side": outcome,
+                    })
                 return True
             else:
                 log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -260,56 +265,73 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
 def place_order(token_id, outcome, price, bet_size, btc_entry):
     return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry))
 
-def monitor_positions():
+def monitor_loop():
     global daily_pnl, open_positions
-    to_remove = []
-    btc_current = get_btc_price()
+    log.info("Thread surveillance demarre - toutes les " + str(int(MONITOR_INTERVAL)) + "s")
+    while True:
+        try:
+            with positions_lock:
+                positions_copy = list(open_positions)
 
-    for pos in open_positions:
-        token_id = pos["token_id"]
-        current = get_token_price(token_id)
-        if current <= 0:
-            continue
-        entry = pos["entry_price"]
-        shares = pos["shares"]
-        btc_entry = pos.get("btc_entry", 0)
-        side = pos.get("side", "Up")
+            if not positions_copy:
+                time.sleep(MONITOR_INTERVAL)
+                continue
 
-        log.info("Position " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
+            btc_current = get_btc_price()
+            to_remove = []
 
-        if current >= TAKE_PROFIT_PRICE:
-            log.info("TAKE PROFIT! @ " + str(round(current, 2)))
-            if sell_order(token_id, shares, "TP", current):
-                daily_pnl += (current - entry) * shares
-                log.info("PnL: +" + str(round((current - entry) * shares, 2)) + " USDC")
-                to_remove.append(pos)
+            for pos in positions_copy:
+                token_id = pos["token_id"]
+                current = get_token_price(token_id)
+                if current <= 0:
+                    continue
+                entry = pos["entry_price"]
+                shares = pos["shares"]
+                btc_entry = pos.get("btc_entry", 0)
+                side = pos.get("side", "Up")
 
-        elif current <= STOP_LOSS_PRICE:
-            log.info("STOP LOSS! @ " + str(round(current, 2)))
-            if sell_order(token_id, shares, "SL", current):
-                daily_pnl += (current - entry) * shares
-                log.info("PnL: " + str(round((current - entry) * shares, 2)) + " USDC")
-                to_remove.append(pos)
+                log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
-        elif btc_entry > 0 and btc_current > 0:
-            if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
-                log.info("STOP BTC DOWN!")
-                if sell_order(token_id, shares, "SL_BTC", current):
-                    daily_pnl += (current - entry) * shares
-                    to_remove.append(pos)
-            elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
-                log.info("STOP BTC UP!")
-                if sell_order(token_id, shares, "SL_BTC", current):
-                    daily_pnl += (current - entry) * shares
-                    to_remove.append(pos)
+                if current >= TAKE_PROFIT_PRICE:
+                    log.info("TAKE PROFIT! @ " + str(round(current, 2)))
+                    if sell_order(token_id, shares, "TP", current):
+                        daily_pnl += (current - entry) * shares
+                        log.info("PnL: +" + str(round((current - entry) * shares, 2)) + " USDC")
+                        to_remove.append(pos)
 
-    for pos in to_remove:
-        if pos in open_positions:
-            open_positions.remove(pos)
+                elif current <= STOP_LOSS_PRICE:
+                    log.info("STOP LOSS! @ " + str(round(current, 2)))
+                    if sell_order(token_id, shares, "SL", current):
+                        daily_pnl += (current - entry) * shares
+                        log.info("PnL: " + str(round((current - entry) * shares, 2)) + " USDC")
+                        to_remove.append(pos)
+
+                elif btc_entry > 0 and btc_current > 0:
+                    if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
+                        log.info("STOP BTC DOWN!")
+                        if sell_order(token_id, shares, "SL_BTC", current):
+                            daily_pnl += (current - entry) * shares
+                            to_remove.append(pos)
+                    elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
+                        log.info("STOP BTC UP!")
+                        if sell_order(token_id, shares, "SL_BTC", current):
+                            daily_pnl += (current - entry) * shares
+                            to_remove.append(pos)
+
+            if to_remove:
+                with positions_lock:
+                    for pos in to_remove:
+                        if pos in open_positions:
+                            open_positions.remove(pos)
+
+        except Exception as e:
+            log.error("Erreur monitor: " + str(e))
+
+        time.sleep(MONITOR_INTERVAL)
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Final v7 demarre!")
+    log.info("Bot Final v8 - Monitor 30s demarre!")
     log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | Whale min: " + str(MIN_WHALE_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -318,6 +340,9 @@ def run():
     if not WALLET.startswith("0x"):
         log.error("POLYMARKET_WALLET_ADDRESS manquante!")
         return
+
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
 
     while True:
         try:
@@ -334,7 +359,6 @@ def run():
                 time.sleep(3600)
                 continue
 
-            monitor_positions()
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
             # STRATEGIE 1 : Copy Whales
