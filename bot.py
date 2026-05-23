@@ -55,15 +55,6 @@ def check_stop_loss():
 def open_val():
     return sum(p["size"] for p in open_positions)
 
-def wait_for_next_btc_window():
-    now = int(time.time())
-    seconds_in_window = now % 300
-    seconds_left = 300 - seconds_in_window
-    if seconds_left > 270:
-        log.info("Nouvelle fenetre BTC dans " + str(seconds_left) + "s - on attend!")
-        time.sleep(seconds_left)
-    return int(time.time()) - (int(time.time()) % 300)
-
 def calculate_bet_size(slope):
     abs_slope = abs(slope)
     if abs_slope >= 200:
@@ -179,7 +170,7 @@ def get_btc_slope():
         candles = r.json()
         closes = [float(c[4]) for c in candles]
         slope = closes[-1] - closes[0]
-        log.info("BTC courbe: " + str(round(closes[0])) + " → " + str(round(closes[-1])) + " | Pente: " + str(round(slope)) + "$")
+        log.info("BTC courbe: " + str(round(closes[0])) + " -> " + str(round(closes[-1])) + " | Pente: " + str(round(slope)) + "$")
         return slope
     except Exception as e:
         log.error("Erreur courbe BTC: " + str(e))
@@ -351,7 +342,7 @@ def run():
             monitor_positions()
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # ─── STRATEGIE 1 : Copy Whales ───────────────────────
+            # STRATEGIE 1 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
                 markets = get_active_markets()
@@ -380,27 +371,27 @@ def run():
             if check_stop_loss():
                 continue
 
-            # ─── STRATEGIE 2 : BTC 5m SYNCHRONISE ───────────────
+            # STRATEGIE 2 : BTC 5m SYNCHRONISE
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
-
                 now = int(time.time())
                 seconds_in_window = now % 300
                 window_ts = now - seconds_in_window
 
                 if window_ts in traded_windows:
-                    seconds_to_next = 300 - seconds_in_window
-                    log.info("Fenetre deja tradee - prochaine dans " + str(seconds_to_next) + "s")
+                    log.info("Fenetre deja tradee")
                 else:
                     if seconds_in_window > 60:
                         seconds_to_next = 300 - seconds_in_window
-                        log.info("Trop tard dans la fenetre (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
+                        log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                         time.sleep(seconds_to_next)
                         now = int(time.time())
                         window_ts = now - (now % 300)
+                        seconds_in_window = 0
 
-                    log.info("Attente 60s pour stabilisation...")
-time.sleep(60)
+                    log.info("Debut fenetre - attente 60s stabilisation...")
+                    time.sleep(60)
+
                     slope = get_btc_slope()
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
@@ -408,10 +399,10 @@ time.sleep(60)
                     if market:
                         if slope > 25:
                             target = "Up"
-                            log.info("Signal UP - pente +" + str(round(slope)) + "$")
+                            log.info("Signal UP +" + str(round(slope)) + "$")
                         elif slope < -25:
                             target = "Down"
-                            log.info("Signal DOWN - pente " + str(round(slope)) + "$")
+                            log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
                             target = None
                             log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
