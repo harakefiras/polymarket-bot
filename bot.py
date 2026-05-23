@@ -381,10 +381,10 @@ def run():
                 market, window_ts = get_btc_market()
 
                 if market and window_ts not in traded_windows and btc_current > 0:
-                    if slope > 30:
+                    if slope > 25:
                         target = "Up"
                         log.info("Signal UP - pente +" + str(round(slope)) + "$")
-                    elif slope < -30:
+                    elif slope < -25:
                         target = "Down"
                         log.info("Signal DOWN - pente " + str(round(slope)) + "$")
                     else:
