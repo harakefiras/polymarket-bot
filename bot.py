@@ -381,7 +381,7 @@ def run():
                 if window_ts in traded_windows:
                     log.info("Fenetre deja tradee")
                 else:
-                    if seconds_in_window > 60:
+                    if seconds_in_window > 30:
                         seconds_to_next = 300 - seconds_in_window
                         log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                         time.sleep(seconds_to_next)
@@ -389,18 +389,18 @@ def run():
                         window_ts = now - (now % 300)
                         seconds_in_window = 0
 
-                    log.info("Debut fenetre - attente 60s stabilisation...")
-                    time.sleep(60)
+                    log.info("Debut fenetre - attente 30s stabilisation...")
+                    time.sleep(30)
 
                     slope = get_btc_slope()
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
 
                     if market:
-                        if slope > 25:
+                        if slope > 75:
                             target = "Up"
                             log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -25:
+                        elif slope < -75:
                             target = "Down"
                             log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
@@ -416,7 +416,7 @@ def run():
                                     if price <= 0:
                                         price = 0.5
                                     log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.45 <= price <= 0.65:
+                                    if 0.5 <= price <= 0.75:
                                         if place_order(token_id, target, price, bet_size, btc_current):
                                             traded_windows.add(window_ts)
                                     else:
