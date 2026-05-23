@@ -399,7 +399,8 @@ def run():
                         now = int(time.time())
                         window_ts = now - (now % 300)
 
-                    log.info("Debut fenetre BTC - scan!")
+                    log.info("Attente 60s pour stabilisation...")
+time.sleep(60)
                     slope = get_btc_slope()
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
