@@ -1,5 +1,5 @@
-import os, time, logging, requests, hashlib, hmac
-from datetime import datetime
+import os, time, logging, requests, hashlib, hmac, math
+from datetime import date
 
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
@@ -16,18 +16,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("binance_bot")
 
 daily_pnl = 0.0
+pnl_date = date.today()
 open_trade = None
 
 def sign(params):
-    query = "&".join([f"{k}={v}" for k, v in params.items()])
+    query = "&".join([str(k) + "=" + str(v) for k, v in params.items()])
     signature = hmac.new(
-        BINANCE_SECRET_KEY.encode(),
-        query.encode(),
+        BINANCE_SECRET_KEY.encode("utf-8"),
+        query.encode("utf-8"),
         hashlib.sha256
     ).hexdigest()
     return query + "&signature=" + signature
 
-def headers():
+def get_headers():
     return {"X-MBX-APIKEY": BINANCE_API_KEY}
 
 def get_price():
@@ -61,7 +62,7 @@ def get_account_balance():
         ts = int(time.time() * 1000)
         params = {"timestamp": ts}
         query = sign(params)
-        r = requests.get(BASE_URL + "/api/v3/account?" + query, headers=headers(), timeout=10)
+        r = requests.get(BASE_URL + "/api/v3/account?" + query, headers=get_headers(), timeout=10)
         if r.ok:
             balances = r.json().get("balances", [])
             for b in balances:
@@ -85,7 +86,6 @@ def get_lot_size():
         return 0.001
 
 def round_qty(qty, step):
-    import math
     precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
     return round(math.floor(qty / step) * step, precision)
 
@@ -102,10 +102,10 @@ def place_buy_order(price):
             "timestamp": ts
         }
         query = sign(params)
-        r = requests.post(BASE_URL + "/api/v3/order?" + query, headers=headers(), timeout=10)
+        r = requests.post(BASE_URL + "/api/v3/order?" + query, headers=get_headers(), timeout=10)
         if r.ok:
             log.info("BUY " + str(qty) + " BTC @ ~" + str(round(price)) + " | " + str(BET_USDC) + " USDT")
-            return {"qty": qty, "entry_price": price, "side": "BUY"}
+            return {"qty": qty, "entry_price": price}
         else:
             log.error("Erreur BUY: " + str(r.text))
             return None
@@ -124,7 +124,7 @@ def place_sell_order(qty):
             "timestamp": ts
         }
         query = sign(params)
-        r = requests.post(BASE_URL + "/api/v3/order?" + query, headers=headers(), timeout=10)
+        r = requests.post(BASE_URL + "/api/v3/order?" + query, headers=get_headers(), timeout=10)
         if r.ok:
             log.info("SELL " + str(qty) + " BTC")
             return True
@@ -136,9 +136,8 @@ def place_sell_order(qty):
         return False
 
 def run():
-    global daily_pnl, open_trade
-
-    log.info("Bot Binance Grid demarre!")
+    global daily_pnl, pnl_date, open_trade
+    log.info("Bot Binance Scalping demarre!")
     log.info("Symbol: " + SYMBOL + " | Mise: " + str(BET_USDC) + " USDT | TP: " + str(TAKE_PROFIT_PCT*100) + "% | SL: " + str(STOP_LOSS_PCT*100) + "%")
 
     if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
@@ -150,6 +149,12 @@ def run():
 
     while True:
         try:
+            today = date.today()
+            if today != pnl_date:
+                log.info("Nouveau jour - PnL: " + str(round(daily_pnl, 2)))
+                daily_pnl = 0.0
+                pnl_date = today
+
             if daily_pnl <= -DAILY_STOP_LOSS:
                 log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
@@ -161,7 +166,6 @@ def run():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Surveille position ouverte
             if open_trade:
                 entry = open_trade["entry_price"]
                 qty = open_trade["qty"]
@@ -195,7 +199,7 @@ def run():
                         open_trade = trade
 
                 elif slope < -30:
-                    log.info("Signal DOWN " + str(round(slope)) + "$ - pas de BUY")
+                    log.info("Signal DOWN " + str(round(slope)) + "$ - pas de trade")
 
                 else:
                     log.info("Pente faible (" + str(round(slope)) + "$) - attente")
