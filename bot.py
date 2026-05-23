@@ -401,7 +401,7 @@ def run():
                                     price = 0.5
                                 log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
                                 time.sleep(15)
-                                if 0.45 <= price <= 0.65:
+                                if 0.35 <= price <= 0.75:
                                     if place_order(token_id, target, price, bet_size, btc_current):
                                         traded_windows.add(window_ts)
                                 else:
