@@ -397,10 +397,10 @@ def run():
                     market = get_btc_market(window_ts)
 
                     if market:
-                        if slope > 75:
+                        if slope > 20:
                             target = "Up"
                             log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -75:
+                        elif slope < -20:
                             target = "Down"
                             log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
