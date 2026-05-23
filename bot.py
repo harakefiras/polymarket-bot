@@ -1,5 +1,5 @@
 import os, time, random, logging, requests, json, asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
@@ -16,6 +16,9 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 BINANCE_API = "https://api.binance.com"
+TRADED_FILE = "/app/traded_markets.txt"
+
+BLOCKED_KEYWORDS = ["nba", "nhl", "nfl", "mlb", "stanley", "finals", "championship", "season", "playoffs", "super bowl", "world series", "soccer", "football", "basketball", "hockey", "baseball"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
@@ -24,8 +27,26 @@ daily_pnl = 0.0
 pnl_date = date.today()
 seen_trades = set()
 traded_windows = set()
-traded_markets = set()
 open_positions = []
+
+def load_traded_markets():
+    try:
+        if os.path.exists(TRADED_FILE):
+            with open(TRADED_FILE, "r") as f:
+                return set(line.strip() for line in f if line.strip())
+        return set()
+    except:
+        return set()
+
+def save_traded_market(market_id):
+    try:
+        with open(TRADED_FILE, "a") as f:
+            f.write(market_id + "\n")
+    except Exception as e:
+        log.error("Erreur sauvegarde marche: " + str(e))
+
+traded_markets = load_traded_markets()
+log.info("Marches deja trades charges: " + str(len(traded_markets)))
 
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
@@ -33,26 +54,40 @@ def check_stop_loss():
 def open_val():
     return sum(p["size"] for p in open_positions)
 
+def is_market_valid(market):
+    question = (market.get("question") or "").lower()
+    slug = (market.get("slug") or "").lower()
+
+    for kw in BLOCKED_KEYWORDS:
+        if kw in question or kw in slug:
+            return False
+
+    end_date = market.get("endDateIso") or market.get("endDate")
+    if not end_date:
+        log.info("Marche sans date de fin - ignore")
+        return False
+
+    try:
+        end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        hours_left = (end - now).total_seconds() / 3600
+        if hours_left <= 0 or hours_left > MAX_MARKET_HOURS:
+            return False
+        return True
+    except Exception as e:
+        log.warning("Erreur date marche: " + str(e))
+        return False
+
 def get_active_markets():
     try:
         r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 50}, timeout=10)
         if not r.ok:
             return []
         markets = r.json()
-        filtered = []
-        now = datetime.utcnow()
-        for m in markets:
-            end_date = m.get("endDateIso") or m.get("endDate")
-            if not end_date:
-                continue
-            try:
-                end = datetime.fromisoformat(end_date.replace("Z", ""))
-                hours_left = (end - now).total_seconds() / 3600
-                if 0 < hours_left <= MAX_MARKET_HOURS:
-                    filtered.append(m)
-            except:
-                continue
-        log.info("Marches < " + str(int(MAX_MARKET_HOURS)) + "h: " + str(len(filtered)))
+        filtered = [m for m in markets if is_market_valid(m)]
+        log.info("Marches valides (<" + str(int(MAX_MARKET_HOURS)) + "h, non sportifs): " + str(len(filtered)))
         return filtered
     except Exception as e:
         log.error("Erreur marches: " + str(e))
@@ -274,10 +309,10 @@ def monitor_positions():
             open_positions.remove(pos)
 
 def run():
-    global daily_pnl, pnl_date
-    log.info("Bot Final v1 demarre!")
+    global daily_pnl, pnl_date, traded_markets
+    log.info("Bot Final v2 demarre!")
     log.info("Mise: " + str(BET_SIZE_USDC) + " | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
-    log.info("Whale min: " + str(MIN_WHALE_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL: " + str(STOP_LOSS_PRICE) + " | Max heures marche: " + str(MAX_MARKET_HOURS))
+    log.info("Whale min: " + str(MIN_WHALE_USDC) + " | TP: " + str(TAKE_PROFIT_PRICE) + " | SL: " + str(STOP_LOSS_PRICE) + " | Max heures: " + str(MAX_MARKET_HOURS))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -295,7 +330,6 @@ def run():
                 pnl_date = today
                 seen_trades.clear()
                 traded_windows.clear()
-                traded_markets.clear()
 
             if check_stop_loss():
                 log.warning("Stop-loss journalier atteint! Pause 1h.")
@@ -303,7 +337,6 @@ def run():
                 continue
 
             monitor_positions()
-
             log.info("Positions ouvertes: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " USDC")
 
             # ─── STRATEGIE 1 : Copy Whales ───────────────────────
@@ -328,6 +361,7 @@ def run():
                             if place_order(w["token_id"], w["outcome"], price):
                                 seen_trades.add(w["id"])
                                 traded_markets.add(w["market_id"])
+                                save_traded_market(w["market_id"])
                         else:
                             log.info("Prix hors fourchette: " + str(round(price, 2)))
                 else:
@@ -378,4 +412,4 @@ def run():
         time.sleep(wait)
 
 if __name__ == "__main__":
-    log.info("Bot en pause")
+    run()
