@@ -11,7 +11,7 @@ POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
 TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.80"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
-MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "48"))
+MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -280,7 +280,7 @@ def monitor_positions():
         btc_entry = pos.get("btc_entry", 0)
         side = pos.get("side", "Up")
 
-        log.info("Position " + side + " | Token: " + str(round(current, 2)) + " | BTC entry: " + str(round(btc_entry)) + " | BTC now: " + str(round(btc_current)))
+        log.info("Position " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
         if current >= TAKE_PROFIT_PRICE:
             log.info("TAKE PROFIT! @ " + str(round(current, 2)))
@@ -314,7 +314,7 @@ def monitor_positions():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Final v5 - Synchronise BTC Windows demarre!")
+    log.info("Bot Final v6 demarre!")
     log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -381,7 +381,7 @@ def run():
                 if window_ts in traded_windows:
                     log.info("Fenetre deja tradee")
                 else:
-                    if seconds_in_window > 30:
+                    if seconds_in_window > 90:
                         seconds_to_next = 300 - seconds_in_window
                         log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                         time.sleep(seconds_to_next)
@@ -389,18 +389,19 @@ def run():
                         window_ts = now - (now % 300)
                         seconds_in_window = 0
 
-                    log.info("Debut fenetre - attente 30s stabilisation...")
-                    time.sleep(30)
+                    if seconds_in_window < 30:
+                        log.info("Attente 30s stabilisation...")
+                        time.sleep(30)
 
                     slope = get_btc_slope()
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
 
                     if market:
-                        if slope > 20:
+                        if slope > 25:
                             target = "Up"
                             log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -20:
+                        elif slope < -25:
                             target = "Down"
                             log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
@@ -416,7 +417,7 @@ def run():
                                     if price <= 0:
                                         price = 0.5
                                     log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.5 <= price <= 0.75:
+                                    if 0.50 <= price <= 0.75:
                                         if place_order(token_id, target, price, bet_size, btc_current):
                                             traded_windows.add(window_ts)
                                     else:
