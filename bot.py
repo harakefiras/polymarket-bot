@@ -292,6 +292,12 @@ def monitor_loop():
 
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
+                # Marche expire
+                if current <= 0.02 or current >= 0.98:
+                    log.info("Marche expire - suppression position")
+                    to_remove.append(pos)
+                    continue
+
                 if current >= TAKE_PROFIT_PRICE:
                     log.info("TAKE PROFIT! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "TP", current):
@@ -331,7 +337,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Final v8 - Monitor 30s demarre!")
+    log.info("Bot Final v9 - Expire fix demarre!")
     log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | Whale min: " + str(MIN_WHALE_USDC))
 
     if not PRIVATE_KEY.startswith("0x"):
