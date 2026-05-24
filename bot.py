@@ -454,6 +454,5 @@ def run():
         wait = POLL_INTERVAL + random.uniform(0, 10)
         log.info("Prochain scan dans " + str(int(wait/60)) + " min")
         time.sleep(wait)
-
 if __name__ == "__main__":
-    run()
+    log.info("Bot en pause")
