@@ -210,4 +210,4 @@ def run():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    log.info("Bot en pause")
+    run()
