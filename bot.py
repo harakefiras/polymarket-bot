@@ -1,4 +1,4 @@
-import os, time, random, logging, requests, json, asyncio
+import os, time, random, logging, requests, json, asyncio, re
 from datetime import date, datetime, timezone
 import threading
 
@@ -79,7 +79,6 @@ def analyze_patterns():
 
 def calculate_smart_bet(gap, patterns):
     base = BASE_BET
-    # Mise basee sur l'ecart entre prix actuel et prix a battre
     if abs(gap) >= 200:
         bet = MAX_BET
     elif abs(gap) >= 100:
@@ -88,12 +87,9 @@ def calculate_smart_bet(gap, patterns):
         bet = base * 2
     else:
         bet = base
-
-    # Bonus si win rate eleve
     if patterns and patterns.get("win_rate", 0) >= 0.60:
         bet = min(bet * 1.5, MAX_BET)
         log.info("Bonus win rate: mise x1.5")
-
     bet = round(min(bet, MAX_BET), 1)
     log.info("Gap: " + str(round(gap)) + "$ | Mise smart: " + str(bet) + " USDC")
     return bet
@@ -233,20 +229,20 @@ def get_btc_market_with_reference():
                 tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
                 market["tokens"] = tokens
 
-                # Récupère le prix de référence (prix à battre)
                 ref_price = 0
                 try:
                     ref_price = float(market.get("startPrice") or market.get("groupItemThreshold") or 0)
                 except:
                     pass
 
-                # Si pas dans les métadonnées, essaie description
                 if ref_price == 0:
-                    description = market.get("description", "")
-                    import re
+                    description = str(market.get("description", ""))
                     match = re.search(r'\$([0-9,]+\.?[0-9]*)', description)
                     if match:
-                        ref_price = float(match.group(1).replace(",", ""))
+                        try:
+                            ref_price = float(match.group(1).replace(",", ""))
+                        except:
+                            ref_price = 0
 
                 log.info("Marche BTC | Ref: " + str(round(ref_price)) + "$ | Window: " + str(window_ts))
                 return market, window_ts, ref_price
@@ -356,56 +352,34 @@ def monitor_loop():
 
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
-                # Marche expire - gain
                 if current >= 0.98:
-                    log.info("Marche expire - GAIN! 🎉")
+                    log.info("Marche expire - GAIN!")
                     pnl = (1.0 - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
-                    save_trade({
-                        "result": "win",
-                        "gap": pos.get("gap", 0),
-                        "entry_price": entry,
-                        "hour": pos.get("hour", 0),
-                        "pnl": round(pnl, 2)
-                    })
+                    save_trade({"result": "win", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                     log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
 
-                # Marche expire - perte
                 elif current <= 0.02:
                     log.info("Marche expire - PERTE")
                     pnl = (current - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
-                    save_trade({
-                        "result": "loss",
-                        "gap": pos.get("gap", 0),
-                        "entry_price": entry,
-                        "hour": pos.get("hour", 0),
-                        "pnl": round(pnl, 2)
-                    })
+                    save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                     to_remove.append(pos)
                     continue
 
-                # Stop Loss token
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
-                        save_trade({
-                            "result": "loss",
-                            "gap": pos.get("gap", 0),
-                            "entry_price": entry,
-                            "hour": pos.get("hour", 0),
-                            "pnl": round(pnl, 2)
-                        })
+                        save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                         to_remove.append(pos)
 
-                # Stop BTC deviation
                 elif btc_entry > 0 and btc_current > 0:
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
@@ -468,7 +442,6 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # STRATEGIE 1 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
                 markets = get_active_markets()
@@ -497,7 +470,6 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m - PRIX DE REFERENCE
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M PRIX REFERENCE ===")
                 now = int(time.time())
@@ -527,20 +499,18 @@ def run():
                             gap = btc_current - ref_price
                             log.info("Prix a battre: " + str(round(ref_price)) + "$ | BTC actuel: " + str(round(btc_current)) + "$ | Ecart: " + str(round(gap)) + "$")
 
-                            # Signal basé sur l'écart entre prix actuel et prix de référence
                             if gap > 20:
                                 target = "Up"
-                                log.info("BTC AU DESSUS de la reference! Signal UP +" + str(round(gap)) + "$")
+                                log.info("BTC AU DESSUS! Signal UP +" + str(round(gap)) + "$")
                             elif gap < -20:
                                 target = "Down"
-                                log.info("BTC EN DESSOUS de la reference! Signal DOWN " + str(round(gap)) + "$")
+                                log.info("BTC EN DESSOUS! Signal DOWN " + str(round(gap)) + "$")
                             else:
                                 target = None
-                                log.info("BTC trop proche de la reference (" + str(round(gap)) + "$) - pas de trade")
+                                log.info("BTC trop proche (" + str(round(gap)) + "$) - pas de trade")
                         else:
-                            # Fallback sur la pente si pas de prix de référence
-                            log.info("Prix reference non disponible - fallback pente")
                             target = None
+                            log.info("Prix reference non disponible - pas de trade")
 
                         if target:
                             patterns = analyze_patterns()
