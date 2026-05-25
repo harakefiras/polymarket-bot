@@ -192,13 +192,13 @@ def run():
             else:
                 slope = get_slope()
 
-                if slope > 30:
+                if slope > 15:
                     log.info("Signal UP +" + str(round(slope)) + "$ - BUY!")
                     trade = place_buy_order(current_price)
                     if trade:
                         open_trade = trade
 
-                elif slope < -30:
+                elif slope < -15:
                     log.info("Signal DOWN " + str(round(slope)) + "$ - pas de trade")
 
                 else:
