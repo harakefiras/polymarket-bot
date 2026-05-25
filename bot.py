@@ -28,6 +28,9 @@ BLOCKED_KEYWORDS = ["nba", "nhl", "nfl", "mlb", "stanley", "finals", "championsh
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
 
+# Prix de reference par fenetre : {window_ts: btc_price}
+window_ref_prices = {}
+
 def load_daily_pnl():
     try:
         if os.path.exists(PNL_FILE):
@@ -214,10 +217,8 @@ def get_btc_price():
     except:
         return 0
 
-def get_btc_market_with_reference():
+def get_btc_market(window_ts):
     try:
-        now = int(time.time())
-        window_ts = now - (now % 300)
         slug = "btc-updown-5m-" + str(window_ts)
         r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
         if r.ok:
@@ -228,28 +229,11 @@ def get_btc_market_with_reference():
                 token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
                 tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
                 market["tokens"] = tokens
-
-                ref_price = 0
-                try:
-                    ref_price = float(market.get("startPrice") or market.get("groupItemThreshold") or 0)
-                except:
-                    pass
-
-                if ref_price == 0:
-                    description = str(market.get("description", ""))
-                    match = re.search(r'\$([0-9,]+\.?[0-9]*)', description)
-                    if match:
-                        try:
-                            ref_price = float(match.group(1).replace(",", ""))
-                        except:
-                            ref_price = 0
-
-                log.info("Marche BTC | Ref: " + str(round(ref_price)) + "$ | Window: " + str(window_ts))
-                return market, window_ts, ref_price
-        return None, None, 0
+                return market
+        return None
     except Exception as e:
         log.error("Erreur marche BTC: " + str(e))
-        return None, None, 0
+        return None
 
 def get_token_price(token_id):
     try:
@@ -301,7 +285,7 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, gap):
                 size=str(shares),
             )
             if response.ok:
-                log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC: " + str(round(btc_entry)) + " | Gap: " + str(round(gap)) + "$")
+                log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC ref: " + str(round(btc_entry)) + " | Gap: " + str(round(gap)) + "$")
                 with positions_lock:
                     open_positions.append({
                         "token_id": token_id,
@@ -409,9 +393,36 @@ def monitor_loop():
 
         time.sleep(MONITOR_INTERVAL)
 
+def record_window_ref_price():
+    """Thread qui enregistre le prix BTC au debut exact de chaque fenetre de 5 minutes"""
+    global window_ref_prices
+    log.info("Thread prix reference demarre")
+    while True:
+        try:
+            now = int(time.time())
+            seconds_in_window = now % 300
+
+            # Au debut de la fenetre (0-5 secondes) -> enregistre le prix
+            if seconds_in_window <= 5:
+                window_ts = now - seconds_in_window
+                if window_ts not in window_ref_prices:
+                    btc_price = get_btc_price()
+                    if btc_price > 0:
+                        window_ref_prices[window_ts] = btc_price
+                        log.info("Prix reference enregistre | Fenetre " + str(window_ts) + " | BTC: " + str(round(btc_price)))
+                    # Nettoie les vieilles fenetres
+                    old_keys = [k for k in window_ref_prices if k < window_ts - 600]
+                    for k in old_keys:
+                        del window_ref_prices[k]
+
+            time.sleep(1)
+        except Exception as e:
+            log.error("Erreur ref price thread: " + str(e))
+            time.sleep(1)
+
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v2 - Prix Reference demarre!")
+    log.info("Bot Smart v3 - Prix Reference Binance demarre!")
     log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -421,8 +432,13 @@ def run():
         log.error("POLYMARKET_WALLET_ADDRESS manquante!")
         return
 
+    # Thread surveillance positions
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
+
+    # Thread enregistrement prix de reference
+    ref_thread = threading.Thread(target=record_window_ref_price, daemon=True)
+    ref_thread.start()
 
     while True:
         try:
@@ -442,6 +458,7 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
+            # STRATEGIE 1 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
                 markets = get_active_markets()
@@ -470,6 +487,7 @@ def run():
             if check_stop_loss():
                 continue
 
+            # STRATEGIE 2 : BTC 5m - PRIX DE REFERENCE BINANCE
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M PRIX REFERENCE ===")
                 now = int(time.time())
@@ -491,43 +509,46 @@ def run():
                         log.info("Attente 30s stabilisation...")
                         time.sleep(30)
 
-                    market, window_ts, ref_price = get_btc_market_with_reference()
+                    # Recupere le prix de reference enregistre au debut de la fenetre
+                    ref_price = window_ref_prices.get(window_ts, 0)
                     btc_current = get_btc_price()
 
-                    if market and btc_current > 0:
-                        if ref_price > 0:
-                            gap = btc_current - ref_price
-                            log.info("Prix a battre: " + str(round(ref_price)) + "$ | BTC actuel: " + str(round(btc_current)) + "$ | Ecart: " + str(round(gap)) + "$")
+                    log.info("Fenetre: " + str(window_ts) + " | Ref: " + str(round(ref_price)) + "$ | Actuel: " + str(round(btc_current)) + "$")
 
-                            if gap > 20:
-                                target = "Up"
-                                log.info("BTC AU DESSUS! Signal UP +" + str(round(gap)) + "$")
-                            elif gap < -20:
-                                target = "Down"
-                                log.info("BTC EN DESSOUS! Signal DOWN " + str(round(gap)) + "$")
-                            else:
-                                target = None
-                                log.info("BTC trop proche (" + str(round(gap)) + "$) - pas de trade")
+                    if ref_price > 0 and btc_current > 0:
+                        gap = btc_current - ref_price
+                        log.info("Ecart: " + str(round(gap)) + "$")
+
+                        if gap > 20:
+                            target = "Up"
+                            log.info("BTC AU DESSUS! Signal UP +" + str(round(gap)) + "$")
+                        elif gap < -20:
+                            target = "Down"
+                            log.info("BTC EN DESSOUS! Signal DOWN " + str(round(gap)) + "$")
                         else:
                             target = None
-                            log.info("Prix reference non disponible - pas de trade")
+                            log.info("BTC trop proche (" + str(round(gap)) + "$) - pas de trade")
 
                         if target:
-                            patterns = analyze_patterns()
-                            bet_size = calculate_smart_bet(gap if ref_price > 0 else 50, patterns)
+                            market = get_btc_market(window_ts)
+                            if market:
+                                patterns = analyze_patterns()
+                                bet_size = calculate_smart_bet(gap, patterns)
 
-                            for token in market.get("tokens", []):
-                                if token["outcome"] == target:
-                                    token_id = token["token_id"]
-                                    price = get_token_price(token_id)
-                                    if price <= 0:
-                                        price = 0.5
-                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.45 <= price <= 0.80:
-                                        if place_order(token_id, target, price, bet_size, btc_current, gap if ref_price > 0 else 0):
-                                            traded_windows.add(window_ts)
-                                    else:
-                                        log.info("Prix hors fourchette: " + str(round(price, 2)))
+                                for token in market.get("tokens", []):
+                                    if token["outcome"] == target:
+                                        token_id = token["token_id"]
+                                        price = get_token_price(token_id)
+                                        if price <= 0:
+                                            price = 0.5
+                                        log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
+                                        if 0.45 <= price <= 0.80:
+                                            if place_order(token_id, target, price, bet_size, ref_price, gap):
+                                                traded_windows.add(window_ts)
+                                        else:
+                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
+                    else:
+                        log.info("Prix reference pas encore enregistre pour cette fenetre")
 
         except Exception as e:
             log.error("Erreur: " + str(e))
