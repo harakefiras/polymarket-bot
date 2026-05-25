@@ -28,7 +28,6 @@ BLOCKED_KEYWORDS = ["nba", "nhl", "nfl", "mlb", "stanley", "finals", "championsh
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
 
-# Prix de reference par fenetre : {window_ts: btc_price}
 window_ref_prices = {}
 
 def load_daily_pnl():
@@ -270,7 +269,7 @@ async def sell_order_async(token_id, shares, reason, price):
 def sell_order(token_id, shares, reason, price):
     return asyncio.run(sell_order_async(token_id, shares, reason, price))
 
-async def place_order_async(token_id, outcome, price, bet_size, btc_entry, gap):
+async def place_order_async(token_id, outcome, price, bet_size, btc_ref, gap):
     try:
         from polymarket import AsyncSecureClient
         shares = round(bet_size / price, 2)
@@ -285,7 +284,7 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, gap):
                 size=str(shares),
             )
             if response.ok:
-                log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC ref: " + str(round(btc_entry)) + " | Gap: " + str(round(gap)) + "$")
+                log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC ref: " + str(round(btc_ref)) + " | Gap: " + str(round(gap)) + "$")
                 with positions_lock:
                     open_positions.append({
                         "token_id": token_id,
@@ -293,7 +292,7 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, gap):
                         "shares": shares,
                         "size": bet_size,
                         "outcome": outcome,
-                        "btc_entry": btc_entry,
+                        "btc_ref": btc_ref,
                         "side": outcome,
                         "gap": gap,
                         "hour": datetime.now().hour,
@@ -306,8 +305,8 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, gap):
         log.error("Exception ordre: " + str(e))
         return False
 
-def place_order(token_id, outcome, price, bet_size, btc_entry, gap=0):
-    return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry, gap))
+def place_order(token_id, outcome, price, bet_size, btc_ref, gap=0):
+    return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_ref, gap))
 
 def monitor_loop():
     global daily_pnl, open_positions
@@ -331,13 +330,14 @@ def monitor_loop():
                     continue
                 entry = pos["entry_price"]
                 shares = pos["shares"]
-                btc_entry = pos.get("btc_entry", 0)
+                btc_ref = pos.get("btc_ref", 0)
                 side = pos.get("side", "Up")
 
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
+                # Marche expire - gain automatique Polymarket
                 if current >= 0.98:
-                    log.info("Marche expire - GAIN!")
+                    log.info("Marche expire - GAIN! Polymarket paie automatiquement")
                     pnl = (1.0 - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
@@ -346,6 +346,7 @@ def monitor_loop():
                     to_remove.append(pos)
                     continue
 
+                # Marche expire - perte
                 elif current <= 0.02:
                     log.info("Marche expire - PERTE")
                     pnl = (current - entry) * shares
@@ -355,6 +356,7 @@ def monitor_loop():
                     to_remove.append(pos)
                     continue
 
+                # Stop Loss token - on limite la casse
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
@@ -364,17 +366,18 @@ def monitor_loop():
                         save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                         to_remove.append(pos)
 
-                elif btc_entry > 0 and btc_current > 0:
-                    if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
-                        log.info("STOP BTC DOWN!")
+                # Stop BTC deviation - BTC part dans le mauvais sens
+                elif btc_ref > 0 and btc_current > 0:
+                    if side == "Up" and btc_current < btc_ref - BTC_DEVIATION:
+                        log.info("STOP BTC DOWN! BTC a decroché: " + str(round(btc_current)) + " < " + str(round(btc_ref - BTC_DEVIATION)))
                         if sell_order(token_id, shares, "SL_BTC", current):
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
                             save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                             to_remove.append(pos)
-                    elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
-                        log.info("STOP BTC UP!")
+                    elif side == "Down" and btc_current > btc_ref + BTC_DEVIATION:
+                        log.info("STOP BTC UP! BTC a decroché: " + str(round(btc_current)) + " > " + str(round(btc_ref + BTC_DEVIATION)))
                         if sell_order(token_id, shares, "SL_BTC", current):
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
@@ -394,36 +397,31 @@ def monitor_loop():
         time.sleep(MONITOR_INTERVAL)
 
 def record_window_ref_price():
-    """Thread qui enregistre le prix BTC au debut exact de chaque fenetre de 5 minutes"""
     global window_ref_prices
     log.info("Thread prix reference demarre")
     while True:
         try:
             now = int(time.time())
             seconds_in_window = now % 300
-
-            # Au debut de la fenetre (0-5 secondes) -> enregistre le prix
             if seconds_in_window <= 5:
                 window_ts = now - seconds_in_window
                 if window_ts not in window_ref_prices:
                     btc_price = get_btc_price()
                     if btc_price > 0:
                         window_ref_prices[window_ts] = btc_price
-                        log.info("Prix reference enregistre | Fenetre " + str(window_ts) + " | BTC: " + str(round(btc_price)))
-                    # Nettoie les vieilles fenetres
+                        log.info("Prix reference | Fenetre " + str(window_ts) + " | BTC: " + str(round(btc_price)))
                     old_keys = [k for k in window_ref_prices if k < window_ts - 600]
                     for k in old_keys:
                         del window_ref_prices[k]
-
             time.sleep(1)
         except Exception as e:
-            log.error("Erreur ref price thread: " + str(e))
+            log.error("Erreur ref thread: " + str(e))
             time.sleep(1)
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v3 - Prix Reference Binance demarre!")
-    log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
+    log.info("Bot Smart v4 - Prix Reference + Monitor demarre!")
+    log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | SL/trade: " + str(STOP_LOSS_PRICE) + " | BTC dev: " + str(BTC_DEVIATION))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -432,11 +430,9 @@ def run():
         log.error("POLYMARKET_WALLET_ADDRESS manquante!")
         return
 
-    # Thread surveillance positions
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 
-    # Thread enregistrement prix de reference
     ref_thread = threading.Thread(target=record_window_ref_price, daemon=True)
     ref_thread.start()
 
@@ -487,7 +483,7 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m - PRIX DE REFERENCE BINANCE
+            # STRATEGIE 2 : BTC 5m
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M PRIX REFERENCE ===")
                 now = int(time.time())
@@ -497,7 +493,7 @@ def run():
                 if window_ts in traded_windows:
                     log.info("Fenetre deja tradee")
                 else:
-                    if seconds_in_window > 90:
+                    if seconds_in_window > 120:
                         seconds_to_next = 300 - seconds_in_window
                         log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                         time.sleep(seconds_to_next)
@@ -505,15 +501,15 @@ def run():
                         window_ts = now - (now % 300)
                         seconds_in_window = 0
 
-                    if seconds_in_window < 30:
-                        log.info("Attente 30s stabilisation...")
-                        time.sleep(30)
+                    if seconds_in_window < 60:
+                        wait_time = 60 - seconds_in_window
+                        log.info("Attente " + str(wait_time) + "s pour etablir tendance...")
+                        time.sleep(wait_time)
 
-                    # Recupere le prix de reference enregistre au debut de la fenetre
                     ref_price = window_ref_prices.get(window_ts, 0)
                     btc_current = get_btc_price()
 
-                    log.info("Fenetre: " + str(window_ts) + " | Ref: " + str(round(ref_price)) + "$ | Actuel: " + str(round(btc_current)) + "$")
+                    log.info("Ref: " + str(round(ref_price)) + "$ | Actuel: " + str(round(btc_current)) + "$")
 
                     if ref_price > 0 and btc_current > 0:
                         gap = btc_current - ref_price
@@ -527,7 +523,7 @@ def run():
                             log.info("BTC EN DESSOUS! Signal DOWN " + str(round(gap)) + "$")
                         else:
                             target = None
-                            log.info("BTC trop proche (" + str(round(gap)) + "$) - pas de trade")
+                            log.info("Ecart trop faible (" + str(round(gap)) + "$) - pas de trade")
 
                         if target:
                             market = get_btc_market(window_ts)
@@ -548,7 +544,7 @@ def run():
                                         else:
                                             log.info("Prix hors fourchette: " + str(round(price, 2)))
                     else:
-                        log.info("Prix reference pas encore enregistre pour cette fenetre")
+                        log.info("Prix reference pas encore disponible")
 
         except Exception as e:
             log.error("Erreur: " + str(e))
