@@ -100,15 +100,6 @@ def save_grid_state():
     except Exception as e:
         log.error("Erreur save grid: " + str(e))
 
-def load_grid_state():
-    try:
-        if os.path.exists(GRID_FILE):
-            with open(GRID_FILE, "r") as f:
-                return json.load(f)
-        return {}
-    except:
-        return {}
-
 def place_order(symbol, side, price, usdt_amount):
     try:
         current_price = get_price(symbol)
@@ -165,10 +156,9 @@ def cancel_order(order_id, symbol):
         return False
 
 def setup_grid(symbol, current_price):
-    # Vérifie s'il y a déjà des ordres ouverts
     existing_orders = get_open_orders(symbol)
     if existing_orders:
-        log.info(symbol + " - " + str(len(existing_orders)) + " ordres existants detectes - annulation...")
+        log.info(symbol + " - " + str(len(existing_orders)) + " ordres existants - annulation...")
         cancel_all_orders(symbol)
         time.sleep(2)
 
@@ -217,7 +207,7 @@ def manage_grid(symbol):
     log.info(symbol + " @ " + str(round(current_price, 2)) + " | Grid PnL: " + str(round(grid["pnl"], 2)) + " USDT")
 
     if current_price <= grid["stop_loss"]:
-        log.warning("STOP LOSS " + symbol + "! " + str(round(current_price, 2)) + " <= " + str(round(grid["stop_loss"], 2)))
+        log.warning("STOP LOSS " + symbol + "!")
         cancel_all_orders(symbol)
         del grids[symbol]
         save_grid_state()
@@ -228,9 +218,9 @@ def manage_grid(symbol):
             if check_order_filled(level["buy_order"], symbol):
                 log.info("BUY rempli @ " + str(level["buy_price"]) + " -> SELL @ " + str(level["sell_price"]))
                 level["filled_buy"] = True
-                sell_order = place_order(symbol, "SELL", level["sell_price"], USDT_PER_LEVEL)
-                if sell_order:
-                    level["sell_order"] = sell_order.get("orderId")
+                sell_ord = place_order(symbol, "SELL", level["sell_price"], USDT_PER_LEVEL)
+                if sell_ord:
+                    level["sell_order"] = sell_ord.get("orderId")
                 save_grid_state()
 
         if level["sell_order"] and level["filled_buy"]:
@@ -239,29 +229,26 @@ def manage_grid(symbol):
                 grid["pnl"] += profit
                 daily_pnl += profit
                 log.info("PROFIT " + symbol + " +" + str(round(profit, 3)) + " USDT | Total: " + str(round(grid["pnl"], 2)))
-
                 level["filled_buy"] = False
                 level["sell_order"] = None
-                buy_order = place_order(symbol, "BUY", level["buy_price"], USDT_PER_LEVEL)
-                if buy_order:
-                    level["buy_order"] = buy_order.get("orderId")
+                buy_ord = place_order(symbol, "BUY", level["buy_price"], USDT_PER_LEVEL)
+                if buy_ord:
+                    level["buy_order"] = buy_ord.get("orderId")
                 save_grid_state()
 
 def run():
     global daily_pnl, pnl_date
 
-    log.info("Bot Grid Trading demarre!")
-    log.info("Paires: BNB + BTC | Niveaux: " + str(GRID_LEVELS) + " | Espacement: " + str(GRID_SPACING_PCT * 100) + "% | Stop-loss: " + str(STOP_LOSS_PCT * 100) + "%")
+    log.info("Bot Grid BNB demarre!")
+    log.info("Niveaux: " + str(GRID_LEVELS) + " | Espacement: " + str(GRID_SPACING_PCT * 100) + "% | USDT/niveau: " + str(USDT_PER_LEVEL) + " | Stop-loss: " + str(STOP_LOSS_PCT * 100) + "%")
 
     if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
         log.error("Cles API manquantes!")
         return
 
-    for symbol in ["BNBUSDT", "BTCUSDT"]:
-        price = get_price(symbol)
-        if price > 0:
-            setup_grid(symbol, price)
-        time.sleep(2)
+    price = get_price("BNBUSDT")
+    if price > 0:
+        setup_grid("BNBUSDT", price)
 
     while True:
         try:
@@ -278,15 +265,12 @@ def run():
                 continue
 
             log.info("PnL jour: " + str(round(daily_pnl, 2)) + " | Grilles: " + str(len(grids)))
+            manage_grid("BNBUSDT")
 
-            for symbol in list(grids.keys()):
-                manage_grid(symbol)
-
-            for symbol in ["BNBUSDT", "BTCUSDT"]:
-                if symbol not in grids:
-                    price = get_price(symbol)
-                    if price > 0:
-                        setup_grid(symbol, price)
+            if "BNBUSDT" not in grids:
+                price = get_price("BNBUSDT")
+                if price > 0:
+                    setup_grid("BNBUSDT", price)
 
         except Exception as e:
             log.error("Erreur: " + str(e))
