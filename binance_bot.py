@@ -278,4 +278,4 @@ def run():
         time.sleep(POLL_INTERVAL)
 
 if __name__ == "__main__":
-    run()
+    log.info("Bot Binance en pause")
