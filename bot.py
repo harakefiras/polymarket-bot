@@ -286,4 +286,341 @@ def get_btc_market(window_ts):
         r = api_get(GAMMA_API + "/markets", {"slug": slug})
         if r:
             data = r.json()
-            market = data[0]
+            market = data[0] if isinstance(data, list) and len(data) > 0 else None
+            if market:
+                outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+                token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
+                tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+                market["tokens"] = tokens
+                return market
+        return None
+    except Exception as e:
+        log.error("Erreur marche BTC: " + str(e))
+        return None
+
+def get_token_price(token_id):
+    try:
+        r = api_get(CLOB_API + "/last-trade-price", {"token_id": token_id})
+        if r:
+            return float(r.json().get("price", 0))
+        return 0
+    except:
+        return 0
+
+async def sell_order_async(token_id, shares, reason, price):
+    try:
+        from polymarket import AsyncSecureClient
+        async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=WALLET,
+        ) as client:
+            response = await client.place_limit_order(
+                token_id=token_id,
+                side="SELL",
+                price=str(round(price, 4)),
+                size=str(round(shares, 2)),
+            )
+            if response.ok:
+                log.info("VENTE " + reason + " @ " + str(round(price, 2)))
+                return True
+            else:
+                log.error("Erreur vente: " + str(response.message))
+                return False
+    except Exception as e:
+        log.error("Exception vente: " + str(e))
+        return False
+
+def sell_order(token_id, shares, reason, price):
+    return asyncio.run(sell_order_async(token_id, shares, reason, price))
+
+async def place_order_async(token_id, outcome, price, bet_size, btc_ref, gap):
+    try:
+        from polymarket import AsyncSecureClient
+        shares = round(bet_size / price, 2)
+        async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY,
+            wallet=WALLET,
+        ) as client:
+            response = await client.place_limit_order(
+                token_id=token_id,
+                side="BUY",
+                price=str(round(price, 4)),
+                size=str(shares),
+            )
+            if response.ok:
+                log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC ref: " + str(round(btc_ref)) + " | Gap: " + str(round(gap)) + "$")
+                with positions_lock:
+                    open_positions.append({
+                        "token_id": token_id,
+                        "entry_price": price,
+                        "shares": shares,
+                        "size": bet_size,
+                        "outcome": outcome,
+                        "btc_ref": btc_ref,
+                        "side": outcome,
+                        "gap": gap,
+                        "hour": datetime.now().hour,
+                    })
+                return True
+            else:
+                log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
+                return False
+    except Exception as e:
+        log.error("Exception ordre: " + str(e))
+        return False
+
+def place_order(token_id, outcome, price, bet_size, btc_ref, gap=0):
+    return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_ref, gap))
+
+def monitor_loop():
+    global daily_pnl, open_positions
+    log.info("Thread surveillance demarre - toutes les " + str(int(MONITOR_INTERVAL)) + "s")
+    while True:
+        try:
+            with positions_lock:
+                positions_copy = list(open_positions)
+
+            if not positions_copy:
+                time.sleep(MONITOR_INTERVAL)
+                continue
+
+            btc_current = get_chainlink_btc_price()
+            to_remove = []
+
+            for pos in positions_copy:
+                token_id = pos["token_id"]
+                current = get_token_price(token_id)
+                if current <= 0:
+                    continue
+                entry = pos["entry_price"]
+                shares = pos["shares"]
+                btc_ref = pos.get("btc_ref", 0)
+                side = pos.get("side", "Up")
+
+                log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
+
+                if current >= 0.98:
+                    log.info("Marche expire - GAIN!")
+                    pnl = (1.0 - entry) * shares
+                    daily_pnl += pnl
+                    save_daily_pnl(daily_pnl)
+                    save_trade({"result": "win", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                    log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
+                    to_remove.append(pos)
+                    continue
+
+                elif current <= 0.02:
+                    log.info("Marche expire - PERTE")
+                    pnl = (current - entry) * shares
+                    daily_pnl += pnl
+                    save_daily_pnl(daily_pnl)
+                    save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                    to_remove.append(pos)
+                    continue
+
+                elif current <= STOP_LOSS_PRICE:
+                    log.info("STOP LOSS! @ " + str(round(current, 2)))
+                    if sell_order(token_id, shares, "SL", current):
+                        pnl = (current - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                        to_remove.append(pos)
+
+                elif btc_ref > 0 and btc_current > 0:
+                    if side == "Up" and btc_current < btc_ref - BTC_DEVIATION:
+                        log.info("STOP BTC DOWN!")
+                        if sell_order(token_id, shares, "SL_BTC", current):
+                            pnl = (current - entry) * shares
+                            daily_pnl += pnl
+                            save_daily_pnl(daily_pnl)
+                            save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                            to_remove.append(pos)
+                    elif side == "Down" and btc_current > btc_ref + BTC_DEVIATION:
+                        log.info("STOP BTC UP!")
+                        if sell_order(token_id, shares, "SL_BTC", current):
+                            pnl = (current - entry) * shares
+                            daily_pnl += pnl
+                            save_daily_pnl(daily_pnl)
+                            save_trade({"result": "loss", "gap": pos.get("gap", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                            to_remove.append(pos)
+
+            if to_remove:
+                with positions_lock:
+                    for pos in to_remove:
+                        if pos in open_positions:
+                            open_positions.remove(pos)
+
+        except Exception as e:
+            log.error("Erreur monitor: " + str(e))
+
+        time.sleep(MONITOR_INTERVAL)
+
+def record_window_ref_price():
+    global window_ref_prices
+    log.info("Thread prix reference Chainlink demarre")
+    while True:
+        try:
+            now = int(time.time())
+            seconds_in_window = now % 300
+            if seconds_in_window <= 5:
+                window_ts = now - seconds_in_window
+                if window_ts not in window_ref_prices:
+                    btc_price = get_chainlink_btc_price()
+                    if btc_price > 0:
+                        window_ref_prices[window_ts] = btc_price
+                        log.info("Prix reference | Fenetre " + str(window_ts) + " | BTC: " + str(round(btc_price)))
+                    old_keys = [k for k in window_ref_prices if k < window_ts - 600]
+                    for k in old_keys:
+                        del window_ref_prices[k]
+            time.sleep(1)
+        except Exception as e:
+            log.error("Erreur ref thread: " + str(e))
+            time.sleep(1)
+
+def run():
+    global daily_pnl, pnl_date, traded_markets, seen_trades, traded_windows
+    log.info("Bot Final v7 - Chainlink + Persistance complete!")
+    log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | SL/trade: " + str(STOP_LOSS_PRICE) + " | Seuil BTC: 50$")
+    log.info("PnL: " + str(round(daily_pnl, 2)) + " | Marches: " + str(len(traded_markets)) + " | Trades vus: " + str(len(seen_trades)) + " | Fenetres: " + str(len(traded_windows)))
+
+    if not PRIVATE_KEY.startswith("0x"):
+        log.error("PRIVATE_KEY manquante!")
+        return
+    if not WALLET.startswith("0x"):
+        log.error("POLYMARKET_WALLET_ADDRESS manquante!")
+        return
+
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+
+    ref_thread = threading.Thread(target=record_window_ref_price, daemon=True)
+    ref_thread.start()
+
+    while True:
+        try:
+            today = date.today()
+            if today != pnl_date:
+                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
+                daily_pnl = 0.0
+                pnl_date = today
+                traded_windows.clear()
+                save_daily_pnl(0.0)
+                try:
+                    open(TRADED_WINDOWS_FILE, "w").close()
+                except:
+                    pass
+
+            if check_stop_loss():
+                log.warning("Stop-loss atteint! Pause 1h.")
+                time.sleep(3600)
+                continue
+
+            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
+
+            # STRATEGIE 1 : Copy Whales
+            if open_val() < MAX_OPEN_USDC:
+                log.info("=== COPY WHALES ===")
+                markets = get_active_markets()
+                whales = detect_whales(markets)
+                if whales:
+                    log.info(str(len(whales)) + " whale(s)!")
+                    for w in whales:
+                        if check_stop_loss() or open_val() + BASE_BET > MAX_OPEN_USDC:
+                            break
+                        log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
+                        time.sleep(5)
+                        price = get_token_price(w["token_id"])
+                        if price <= 0:
+                            price = w["price"]
+                        if 0.45 <= price <= 0.65:
+                            patterns = analyze_patterns()
+                            whale_gap = (w["notional"] - MIN_WHALE_USDC) / 10
+                            bet_size = calculate_smart_bet(whale_gap, patterns)
+                            btc_now = get_chainlink_btc_price()
+                            if place_order(w["token_id"], w["outcome"], price, bet_size, btc_now):
+                                seen_trades.add(w["id"])
+                                save_seen_trade(w["id"])
+                                traded_markets.add(w["market_id"])
+                                save_traded_market(w["market_id"])
+                        else:
+                            log.info("Prix hors fourchette: " + str(round(price, 2)))
+                else:
+                    log.info("Aucune whale")
+
+            if check_stop_loss():
+                continue
+
+            # STRATEGIE 2 : BTC 5m Chainlink
+            if open_val() < MAX_OPEN_USDC:
+                log.info("=== BTC 5M CHAINLINK ===")
+                now = int(time.time())
+                seconds_in_window = now % 300
+                window_ts = now - seconds_in_window
+
+                if window_ts in traded_windows:
+                    log.info("Fenetre deja tradee")
+                else:
+                    if seconds_in_window > 120:
+                        seconds_to_next = 300 - seconds_in_window
+                        log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
+                        time.sleep(seconds_to_next)
+                        now = int(time.time())
+                        window_ts = now - (now % 300)
+                        seconds_in_window = 0
+
+                    if seconds_in_window < 60:
+                        wait_time = 60 - seconds_in_window
+                        log.info("Attente " + str(wait_time) + "s tendance...")
+                        time.sleep(wait_time)
+
+                    ref_price = window_ref_prices.get(window_ts, 0)
+                    btc_current = get_chainlink_btc_price()
+
+                    log.info("Ref: " + str(round(ref_price)) + "$ | Actuel: " + str(round(btc_current)) + "$")
+
+                    if ref_price > 0 and btc_current > 0:
+                        gap = btc_current - ref_price
+                        log.info("Ecart: " + str(round(gap)) + "$")
+
+                        if gap >= 50:
+                            target = "Up"
+                            log.info("Signal UP fort +" + str(round(gap)) + "$")
+                        elif gap <= -50:
+                            target = "Down"
+                            log.info("Signal DOWN fort " + str(round(gap)) + "$")
+                        else:
+                            target = None
+                            log.info("Ecart insuffisant (" + str(round(gap)) + "$) - pas de trade")
+
+                        if target:
+                            market = get_btc_market(window_ts)
+                            if market:
+                                patterns = analyze_patterns()
+                                bet_size = calculate_smart_bet(gap, patterns)
+
+                                for token in market.get("tokens", []):
+                                    if token["outcome"] == target:
+                                        token_id = token["token_id"]
+                                        price = get_token_price(token_id)
+                                        if price <= 0:
+                                            price = 0.5
+                                        log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
+                                        if 0.45 <= price <= 0.65:
+                                            if place_order(token_id, target, price, bet_size, ref_price, gap):
+                                                traded_windows.add(window_ts)
+                                                save_traded_window(window_ts)
+                                        else:
+                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
+                    else:
+                        log.info("Prix reference pas encore disponible")
+
+        except Exception as e:
+            log.error("Erreur: " + str(e))
+
+        wait = POLL_INTERVAL + random.uniform(0, 10)
+        log.info("Prochain scan dans " + str(int(wait/60)) + " min")
+        time.sleep(wait)
+
+if __name__ == "__main__":
+    run()
