@@ -1,5 +1,4 @@
 import os, time, logging, requests, json, asyncio
-from datetime import date, datetime, timezone
 import threading
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
@@ -43,18 +42,18 @@ def get_token_price(token_id):
 
 def get_btc_market(window_ts):
     try:
-        import json as j
         slug = "btc-updown-5m-" + str(window_ts)
         r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
-        if r.ok:
-            data = r.json()
-            market = data[0] if isinstance(data, list) and data else None
-            if market:
-                outcomes = j.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
-                token_ids = j.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
-                market["tokens"] = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
-                return market
-        return None
+        if not r.ok:
+            return None
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        market = data[0]
+        outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+        token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
+        market["tokens"] = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+        return market
     except Exception as e:
         log.error("Erreur marche: " + str(e))
         return None
@@ -77,9 +76,8 @@ async def place_order_async(token_id, outcome, price, btc_ref, gap):
                         "side": outcome, "btc_ref": btc_ref, "gap": gap
                     })
                 return True
-            else:
-                log.error("Erreur ordre: " + str(response.message))
-                return False
+            log.error("Erreur ordre: " + str(response.message))
+            return False
     except Exception as e:
         log.error("Exception ordre: " + str(e))
         return False
@@ -107,7 +105,7 @@ def sell_order(token_id, shares, reason, price):
     return asyncio.run(sell_order_async(token_id, shares, reason, price))
 
 def monitor_loop():
-    global daily_pnl, open_positions
+    global daily_pnl
     log.info("Monitor demarre")
     while True:
         try:
@@ -152,7 +150,6 @@ def monitor_loop():
         time.sleep(30)
 
 def ref_price_loop():
-    global window_ref_prices
     log.info("Prix reference demarre")
     while True:
         try:
@@ -203,7 +200,8 @@ def run():
                     if sec > 120:
                         wait = 300 - sec
                         log.info("Trop tard - attente " + str(wait) + "s")
-                        time.sleep(wait)
+                        for _ in range(wait):
+                            time.sleep(1)
                         now = int(time.time())
                         window_ts = now - (now % 300)
                         sec = 0
@@ -211,7 +209,8 @@ def run():
                     if sec < 60:
                         wait = 60 - sec
                         log.info("Attente " + str(wait) + "s...")
-                        time.sleep(wait)
+                        for _ in range(wait):
+                            time.sleep(1)
 
                     ref_price = window_ref_prices.get(window_ts, 0)
                     btc_current = get_btc_price()
@@ -224,8 +223,10 @@ def run():
 
                         if gap >= 50:
                             target = "Up"
+                            log.info("Signal UP +" + str(round(gap)) + "$")
                         elif gap <= -50:
                             target = "Down"
+                            log.info("Signal DOWN " + str(round(gap)) + "$")
                         else:
                             target = None
                             log.info("Gap insuffisant - pas de trade")
@@ -243,7 +244,7 @@ def run():
                                             if place_order(token["token_id"], target, price, ref_price, gap):
                                                 traded_windows.add(window_ts)
                                         else:
-                                            log.info("Prix hors fourchette")
+                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
                     else:
                         log.info("Prix reference pas disponible")
 
