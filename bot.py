@@ -4,19 +4,18 @@ import threading
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
-BET_SIZE_USDC = float(os.getenv("BET_SIZE_USDC", "5"))
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "20"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "50"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
 MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
+WHALE_MAX_HOURS = float(os.getenv("WHALE_MAX_HOURS", "48"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BASE_BET = float(os.getenv("BASE_BET", "3"))
 MAX_BET = float(os.getenv("MAX_BET", "50"))
 
-# Heures actives UTC (évite le bruit nocturne)
 ACTIVE_HOURS = list(range(7, 23))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -27,19 +26,8 @@ TRADED_FILE = "/app/traded_markets.txt"
 PNL_FILE = "/app/daily_pnl.txt"
 TRADES_FILE = "/app/trades_history.json"
 
-BLOCKED_KEYWORDS = [
-    "nba", "nhl", "nfl", "mlb", "stanley", "finals", "championship",
-    "season", "playoffs", "super bowl", "world series", "soccer",
-    "football", "basketball", "hockey", "baseball"
-]
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
-
-
-# ─────────────────────────────────────────────
-# PnL & Historique
-# ─────────────────────────────────────────────
 
 def load_daily_pnl():
     try:
@@ -90,60 +78,26 @@ def analyze_patterns():
     log.info("Patterns: " + str(len(history)) + " trades | Win rate: " + str(round(win_rate * 100, 1)) + "%")
     return {"win_rate": win_rate, "total_trades": len(history)}
 
-
-# ─────────────────────────────────────────────
-# AMÉLIORATION 3 : Heures actives
-# ─────────────────────────────────────────────
-
 def is_active_hour():
-    """Retourne True si on est dans une heure active BTC (7h-23h UTC)."""
     return datetime.now(timezone.utc).hour in ACTIVE_HOURS
 
-
-# ─────────────────────────────────────────────
-# AMÉLIORATION 2 : Kelly Criterion
-# ─────────────────────────────────────────────
-
 def calculate_bet_size_kelly(slope):
-    """
-    Calcule la mise via le Critère de Kelly simplifié.
-    - Utilise le win rate réel si >= 20 trades disponibles
-    - Module par la force du signal BTC
-    """
-    win_rate = 0.55  # valeur par défaut conservatrice
-
+    win_rate = 0.55
     patterns = analyze_patterns()
     if patterns and patterns["total_trades"] >= 20:
         win_rate = patterns["win_rate"]
         log.info("Kelly: win rate réel = " + str(round(win_rate * 100, 1)) + "%")
     else:
         log.info("Kelly: win rate par défaut = " + str(round(win_rate * 100, 1)) + "%")
-
-    # Fraction Kelly (b=1 : gain = mise)
     kelly = win_rate - (1 - win_rate)
-    kelly = max(0.05, min(kelly, 0.3))  # clamp entre 5% et 30%
-
-    # Multiplicateur signal
+    kelly = max(0.05, min(kelly, 0.3))
     signal_multiplier = min(abs(slope) / 100, 2.0)
-
     bet = BASE_BET + (MAX_BET - BASE_BET) * kelly * signal_multiplier
     bet = round(min(bet, MAX_BET), 1)
-
     log.info("Kelly | Slope: " + str(round(slope)) + "$ | Kelly%: " + str(round(kelly * 100, 1)) + "% | Mise: " + str(bet) + " USDC")
     return bet
 
-
-# ─────────────────────────────────────────────
-# AMÉLIORATION 1 : Signal BTC amélioré (RSI + Volume)
-# ─────────────────────────────────────────────
-
 def get_btc_signal():
-    """
-    Retourne (slope, rsi, vol_confirm) basé sur 14 bougies 1m.
-    - slope  : variation de prix sur les 5 dernières bougies
-    - rsi    : RSI(13) simplifié
-    - vol_confirm : True si le volume de la dernière bougie > moyenne des 4 précédentes
-    """
     try:
         r = requests.get(
             BINANCE_API + "/api/v3/klines",
@@ -152,41 +106,23 @@ def get_btc_signal():
         )
         if not r.ok:
             return 0, 50, False
-
         candles = r.json()
         closes  = [float(c[4]) for c in candles]
         volumes = [float(c[5]) for c in candles]
-
-        # Pente sur les 5 dernières bougies
-        slope = closes[-1] - closes[-5]
-
-        # RSI simplifié sur 13 périodes
-        gains  = [max(closes[i] - closes[i - 1], 0) for i in range(1, len(closes))]
-        losses = [max(closes[i - 1] - closes[i], 0) for i in range(1, len(closes))]
+        slope   = closes[-1] - closes[-5]
+        gains   = [max(closes[i] - closes[i-1], 0) for i in range(1, len(closes))]
+        losses  = [max(closes[i-1] - closes[i], 0) for i in range(1, len(closes))]
         avg_gain = sum(gains) / 13
         avg_loss = sum(losses) / 13
         rs  = avg_gain / (avg_loss + 1e-9)
         rsi = 100 - (100 / (1 + rs))
-
-        # Confirmation volume : dernière bougie > moyenne des 4 précédentes
         avg_vol     = sum(volumes[-5:-1]) / 4 if len(volumes) >= 5 else volumes[-1]
-        vol_confirm = volumes[-1] > avg_vol
-
-        log.info(
-            "BTC Signal | Slope: " + str(round(slope)) +
-            "$ | RSI: " + str(round(rsi, 1)) +
-            " | Vol OK: " + str(vol_confirm)
-        )
+        vol_confirm = volumes[-1] > avg_vol * 0.75
+        log.info("BTC Signal | Slope: " + str(round(slope)) + "$ | RSI: " + str(round(rsi, 1)) + " | Vol OK: " + str(vol_confirm))
         return slope, rsi, vol_confirm
-
     except Exception as e:
         log.error("Erreur signal BTC: " + str(e))
         return 0, 50, False
-
-
-# ─────────────────────────────────────────────
-# Utilitaires marché
-# ─────────────────────────────────────────────
 
 daily_pnl      = load_daily_pnl()
 pnl_date       = date.today()
@@ -220,32 +156,32 @@ def open_val():
     with positions_lock:
         return sum(p["size"] for p in open_positions)
 
-def is_market_valid(market):
-    question = (market.get("question") or "").lower()
-    slug     = (market.get("slug")     or "").lower()
-    for kw in BLOCKED_KEYWORDS:
-        if kw in question or kw in slug:
-            return False
+def get_hours_left(market):
     end_date = market.get("endDateIso") or market.get("endDate")
     if not end_date:
-        return False
+        return 0
     try:
         end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
         if end.tzinfo is None:
             end = end.replace(tzinfo=timezone.utc)
-        now       = datetime.now(timezone.utc)
-        hours_left = (end - now).total_seconds() / 3600
-        return 0 < hours_left <= MAX_MARKET_HOURS
+        now = datetime.now(timezone.utc)
+        return (end - now).total_seconds() / 3600
     except:
-        return False
+        return 0
 
-def get_active_markets():
+def is_market_valid(market, max_hours=None):
+    if max_hours is None:
+        max_hours = MAX_MARKET_HOURS
+    hours_left = get_hours_left(market)
+    return 0 < hours_left <= max_hours
+
+def get_active_markets(max_hours=None):
     try:
         r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 50}, timeout=10)
         if not r.ok:
             return []
         markets  = r.json()
-        filtered = [m for m in markets if is_market_valid(m)]
+        filtered = [m for m in markets if is_market_valid(m, max_hours)]
         log.info("Marchés valides: " + str(len(filtered)))
         return filtered
     except Exception as e:
@@ -316,7 +252,7 @@ def get_btc_market(window_ts):
             data   = r.json()
             market = data[0] if isinstance(data, list) and len(data) > 0 else None
             if market:
-                outcomes  = json.loads(market.get("outcomes",     "[]")) if isinstance(market.get("outcomes"),     str) else market.get("outcomes",     [])
+                outcomes  = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
                 token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
                 tokens    = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
                 market["tokens"] = tokens
@@ -334,11 +270,6 @@ def get_token_price(token_id):
         return 0
     except:
         return 0
-
-
-# ─────────────────────────────────────────────
-# Ordres
-# ─────────────────────────────────────────────
 
 async def sell_order_async(token_id, shares, reason, price):
     try:
@@ -374,15 +305,15 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope
                 log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC: " + str(round(btc_entry)))
                 with positions_lock:
                     open_positions.append({
-                        "token_id":   token_id,
+                        "token_id":    token_id,
                         "entry_price": price,
-                        "shares":     shares,
-                        "size":       bet_size,
-                        "outcome":    outcome,
-                        "btc_entry":  btc_entry,
-                        "side":       outcome,
-                        "slope":      slope,
-                        "hour":       datetime.now().hour,
+                        "shares":      shares,
+                        "size":        bet_size,
+                        "outcome":     outcome,
+                        "btc_entry":   btc_entry,
+                        "side":        outcome,
+                        "slope":       slope,
+                        "hour":        datetime.now().hour,
                     })
                 return True
             else:
@@ -395,114 +326,71 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope
 def place_order(token_id, outcome, price, bet_size, btc_entry, slope=0):
     return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry, slope))
 
-
-# ─────────────────────────────────────────────
-# Thread de surveillance
-# ─────────────────────────────────────────────
-
 def monitor_loop():
     global daily_pnl, open_positions
     log.info("Thread surveillance démarré - toutes les " + str(int(MONITOR_INTERVAL)) + "s")
-
     while True:
         try:
             with positions_lock:
                 positions_copy = list(open_positions)
-
             if not positions_copy:
                 time.sleep(MONITOR_INTERVAL)
                 continue
-
             btc_current = get_btc_price()
             to_remove   = []
-
             for pos in positions_copy:
                 token_id  = pos["token_id"]
                 current   = get_token_price(token_id)
                 if current <= 0:
                     continue
-                entry      = pos["entry_price"]
-                shares     = pos["shares"]
-                btc_entry  = pos.get("btc_entry", 0)
-                side       = pos.get("side", "Up")
-
+                entry     = pos["entry_price"]
+                shares    = pos["shares"]
+                btc_entry = pos.get("btc_entry", 0)
+                side      = pos.get("side", "Up")
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
-                # ── AMÉLIORATION 4 : Take Profit partiel à 0.80 ──
                 if current >= 0.80 and entry < 0.65 and not pos.get("partial_tp_done"):
                     half_shares = round(shares / 2, 2)
-                    log.info("TAKE PROFIT PARTIEL @ " + str(round(current, 2)) + " | " + str(half_shares) + " shares vendues")
+                    log.info("TAKE PROFIT PARTIEL @ " + str(round(current, 2)))
                     if sell_order(token_id, half_shares, "TP_PARTIAL", current):
                         pnl = (current - entry) * half_shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
-                        save_trade({
-                            "result":      "partial_win",
-                            "slope":       pos.get("slope", 0),
-                            "entry_price": entry,
-                            "exit_price":  current,
-                            "hour":        pos.get("hour", 0),
-                            "pnl":         round(pnl, 2),
-                        })
+                        save_trade({"result": "partial_win", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": current, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                         pos["shares"]          = half_shares
                         pos["size"]            = pos["size"] / 2
                         pos["partial_tp_done"] = True
                         log.info("PnL partiel: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     continue
 
-                # Marché expiré – GAIN
                 if current >= 0.98:
                     log.info("Marché expiré - GAIN!")
                     pnl = (1.0 - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
-                    save_trade({
-                        "result":      "win",
-                        "slope":       pos.get("slope", 0),
-                        "entry_price": entry,
-                        "exit_price":  1.0,
-                        "hour":        pos.get("hour", 0),
-                        "pnl":         round(pnl, 2),
-                    })
+                    save_trade({"result": "win", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": 1.0, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                     log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
 
-                # Marché expiré – PERTE
                 elif current <= 0.02:
                     log.info("Marché expiré - PERTE")
                     pnl = (current - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
-                    save_trade({
-                        "result":      "loss",
-                        "slope":       pos.get("slope", 0),
-                        "entry_price": entry,
-                        "exit_price":  current,
-                        "hour":        pos.get("hour", 0),
-                        "pnl":         round(pnl, 2),
-                    })
+                    save_trade({"result": "loss", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": current, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                     to_remove.append(pos)
                     continue
 
-                # Stop-loss prix
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
-                        save_trade({
-                            "result":      "loss",
-                            "slope":       pos.get("slope", 0),
-                            "entry_price": entry,
-                            "exit_price":  current,
-                            "hour":        pos.get("hour", 0),
-                            "pnl":         round(pnl, 2),
-                        })
+                        save_trade({"result": "loss", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": current, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                         to_remove.append(pos)
 
-                # Stop BTC
                 elif btc_entry > 0 and btc_current > 0:
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
@@ -510,14 +398,7 @@ def monitor_loop():
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
-                            save_trade({
-                                "result":      "loss",
-                                "slope":       pos.get("slope", 0),
-                                "entry_price": entry,
-                                "exit_price":  current,
-                                "hour":        pos.get("hour", 0),
-                                "pnl":         round(pnl, 2),
-                            })
+                            save_trade({"result": "loss", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": current, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                             to_remove.append(pos)
                     elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
                         log.info("STOP BTC UP!")
@@ -525,14 +406,7 @@ def monitor_loop():
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
-                            save_trade({
-                                "result":      "loss",
-                                "slope":       pos.get("slope", 0),
-                                "entry_price": entry,
-                                "exit_price":  current,
-                                "hour":        pos.get("hour", 0),
-                                "pnl":         round(pnl, 2),
-                            })
+                            save_trade({"result": "loss", "slope": pos.get("slope", 0), "entry_price": entry, "exit_price": current, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
                             to_remove.append(pos)
 
             if to_remove:
@@ -543,17 +417,11 @@ def monitor_loop():
 
         except Exception as e:
             log.error("Erreur monitor: " + str(e))
-
         time.sleep(MONITOR_INTERVAL)
-
-
-# ─────────────────────────────────────────────
-# Boucle principale
-# ─────────────────────────────────────────────
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v2 - Optimisé (RSI + Kelly + TP Partiel + Heures actives)")
+    log.info("Bot Smart v3 - RSI + Kelly + TP Partiel + Whales 48h")
     log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
     log.info("PnL chargé: " + str(round(daily_pnl, 2)))
 
@@ -585,10 +453,10 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # ── STRATÉGIE 1 : Copy Whales ──────────────────────
+            # STRATEGIE 1 : Copy Whales - marchés < 48h uniquement
             if open_val() < MAX_OPEN_USDC:
-                log.info("=== COPY WHALES ===")
-                markets = get_active_markets()
+                log.info("=== COPY WHALES (48h max) ===")
+                markets = get_active_markets(max_hours=WHALE_MAX_HOURS)
                 whales  = detect_whales(markets)
                 if whales:
                     log.info(str(len(whales)) + " whale(s) détectée(s)!")
@@ -614,17 +482,15 @@ def run():
             if check_stop_loss():
                 continue
 
-            # ── STRATÉGIE 2 : BTC 5m (AMÉLIORÉE) ──────────────
+            # STRATEGIE 2 : BTC 5m
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M v2 ===")
-
-                # Vérification heure active
                 if not is_active_hour():
-                    log.info("Heure creuse (" + str(datetime.now(timezone.utc).hour) + "h UTC) - stratégie BTC suspendue")
+                    log.info("Heure creuse (" + str(datetime.now(timezone.utc).hour) + "h UTC) - suspendu")
                 else:
-                    now              = int(time.time())
+                    now               = int(time.time())
                     seconds_in_window = now % 300
-                    window_ts        = now - seconds_in_window
+                    window_ts         = now - seconds_in_window
 
                     if window_ts in traded_windows:
                         log.info("Fenêtre déjà tradée")
@@ -633,21 +499,19 @@ def run():
                             seconds_to_next = 300 - seconds_in_window
                             log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                             time.sleep(seconds_to_next)
-                            now              = int(time.time())
-                            window_ts        = now - (now % 300)
+                            now               = int(time.time())
+                            window_ts         = now - (now % 300)
                             seconds_in_window = 0
 
                         if seconds_in_window < 30:
                             log.info("Attente 30s stabilisation...")
                             time.sleep(30)
 
-                        # Signal amélioré : RSI + Volume
                         slope, rsi, vol_confirm = get_btc_signal()
                         btc_current = get_btc_price()
                         market      = get_btc_market(window_ts)
 
                         if market:
-                            # Conditions d'entrée strictes
                             if slope > 25 and rsi > 55 and vol_confirm:
                                 target = "Up"
                                 log.info("Signal UP | Slope: +" + str(round(slope)) + "$ | RSI: " + str(round(rsi, 1)) + " | Vol: OK")
@@ -656,10 +520,9 @@ def run():
                                 log.info("Signal DOWN | Slope: " + str(round(slope)) + "$ | RSI: " + str(round(rsi, 1)) + " | Vol: OK")
                             else:
                                 target = None
-                                log.info("Signal trop faible ou non confirmé - pas de trade")
+                                log.info("Signal insuffisant - pas de trade")
 
                             if target:
-                                # Mise Kelly
                                 bet_size = calculate_bet_size_kelly(slope)
                                 for token in market.get("tokens", []):
                                     if token["outcome"] == target:
@@ -668,7 +531,7 @@ def run():
                                         if price <= 0:
                                             price = 0.5
                                         log.info(target + " @ " + str(round(price, 2)) + " | Mise Kelly: " + str(bet_size) + " USDC")
-                                        if 0.50 <= price <= 0.70:
+                                        if 0.50 <= price <= 0.80:
                                             if place_order(token_id, target, price, bet_size, btc_current, slope):
                                                 traded_windows.add(window_ts)
                                         else:
@@ -680,7 +543,6 @@ def run():
         wait = POLL_INTERVAL + random.uniform(0, 10)
         log.info("Prochain scan dans " + str(int(wait / 60)) + " min")
         time.sleep(wait)
-
 
 if __name__ == "__main__":
     run()
