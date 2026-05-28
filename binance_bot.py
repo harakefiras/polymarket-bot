@@ -80,6 +80,7 @@ def run():
                 time.sleep(5)
                 continue
 
+            # Pas de position ouverte — cherche signal
             if position is None:
                 momentum = get_bnb_momentum()
 
@@ -90,6 +91,7 @@ def run():
                 elif momentum <= -0.2:
                     log.info("Momentum négatif - on attend")
 
+            # Position ouverte — surveille TP et SL
             else:
                 entry = position["entry"]
                 qty   = position["qty"]
