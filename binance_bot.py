@@ -10,13 +10,14 @@ TARGET_PROFIT_PCT  = float(os.getenv("TARGET_PROFIT_PCT", "0.003"))
 STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT", "0.002"))
 DAILY_STOP_LOSS    = float(os.getenv("DAILY_STOP_LOSS", "50"))
 
-# BINANCE_SYMBOL — ta variable existante
-# Pour multi-paires, modifie juste la valeur dans Railway :
-# BINANCE_SYMBOL = BNBUSDT                        ← 1 paire
-# BINANCE_SYMBOL = BNBUSDT,ETHUSDT,BTCUSDT        ← multi-paires
-SYMBOLS = os.getenv("BINANCE_SYMBOL", "BNBUSDT").split(",")
+# BINANCE_SYMBOL — verrouillé et nettoyé
+# Valeur Railway actuelle : BNBUSDT → trade uniquement BNB
+# Pour multi-paires plus tard : BNBUSDT,ETHUSDT,BTCUSDT
+RAW_SYMBOLS = os.getenv("BINANCE_SYMBOL", "BNBUSDT")
+SYMBOLS = [s.strip().upper() for s in RAW_SYMBOLS.split(",") if s.strip()]
+if not SYMBOLS:
+    SYMBOLS = ["BNBUSDT"]  # sécurité absolue
 
-# Paramètres avancés — restent en défaut si non ajoutés dans Railway
 MOMENTUM_THRESHOLD = float(os.getenv("MOMENTUM_THRESHOLD", "0.20"))
 RSI_OVERBOUGHT     = float(os.getenv("RSI_OVERBOUGHT", "70"))
 COOLDOWN_SECONDS   = int(os.getenv("COOLDOWN_SECONDS", "300"))
@@ -28,12 +29,10 @@ log = logging.getLogger("binance_bot")
 
 client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
-# ── État global ──────────────────────────────────────────────────────────────
 daily_pnl = 0.0
-positions = {}   # {symbol: {entry, qty, peak}}
-cooldowns = {}   # {symbol: timestamp fin cooldown}
+positions = {}
+cooldowns = {}
 
-# ── Indicateurs ──────────────────────────────────────────────────────────────
 def get_closes(symbol, interval, limit):
     candles = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     return [float(c[4]) for c in candles]
@@ -70,7 +69,7 @@ def get_rsi(symbol, period=14):
         avg_loss = sum(losses) / period
         if avg_loss == 0:
             return 100
-        rs  = avg_gain / avg_loss
+        rs = avg_gain / avg_loss
         return 100 - (100 / (1 + rs))
     except Exception as e:
         log.error(f"Erreur RSI {symbol}: {e}")
@@ -94,7 +93,6 @@ def get_step_size(symbol):
     except:
         return 2
 
-# ── Ordres ────────────────────────────────────────────────────────────────────
 def buy(symbol, price):
     try:
         precision = get_step_size(symbol)
@@ -117,14 +115,13 @@ def sell(symbol, qty, reason, entry):
         log.error(f"Erreur vente {symbol}: {e}")
         return 0, 0
 
-# ── Boucle principale ─────────────────────────────────────────────────────────
 def run():
     global daily_pnl
 
-    log.info("🚀 Bot Scalping Multi-Paires démarré!")
-    log.info(f"Paires: {', '.join(SYMBOLS)}")
+    log.info("🚀 Bot Scalping démarré!")
+    log.info(f"✅ Paires autorisées: {', '.join(SYMBOLS)}")  # ← tu verras exactement ce qui tourne
     log.info(f"Mise: {TRADE_AMOUNT_USDT}$ | TP: {TARGET_PROFIT_PCT*100}% | SL: {STOP_LOSS_PCT*100}%")
-    log.info(f"Trailing Stop: {TRAILING_OFFSET*100}% | Cooldown SL: {COOLDOWN_SECONDS//60}min | Max positions: {MAX_POSITIONS}")
+    log.info(f"Trailing: {TRAILING_OFFSET*100}% | Cooldown: {COOLDOWN_SECONDS//60}min | Max pos: {MAX_POSITIONS}")
 
     if not BINANCE_API_KEY:
         log.error("BINANCE_API_KEY manquante!")
@@ -132,9 +129,8 @@ def run():
 
     while True:
         try:
-            # Stop-loss journalier
             if daily_pnl <= -DAILY_STOP_LOSS:
-                log.warning(f"⛔ Stop-loss journalier atteint ({round(daily_pnl,2)}$). Pause 1h.")
+                log.warning(f"⛔ Stop-loss journalier ({round(daily_pnl,2)}$). Pause 1h.")
                 time.sleep(3600)
                 daily_pnl = 0.0
                 continue
@@ -147,7 +143,6 @@ def run():
                     if price <= 0:
                         continue
 
-                    # Position ouverte → surveille TP / Trailing SL
                     if symbol in positions:
                         pos   = positions[symbol]
                         entry = pos["entry"]
@@ -181,10 +176,9 @@ def run():
                             log.info(f"⏳ Cooldown {symbol} {COOLDOWN_SECONDS//60}min | Total: {round(daily_pnl, 2)}$")
                             del positions[symbol]
 
-                    # Pas de position → cherche signal
                     else:
                         if symbol in cooldowns and now < cooldowns[symbol]:
-                            log.info(f"⏳ {symbol} cooldown: {int(cooldowns[symbol]-now)}s restantes")
+                            log.info(f"⏳ {symbol} cooldown: {int(cooldowns[symbol]-now)}s")
                             continue
 
                         if len(positions) >= MAX_POSITIONS:
@@ -194,7 +188,7 @@ def run():
 
                         if momentum >= MOMENTUM_THRESHOLD:
                             if not get_trend(symbol):
-                                log.info(f"⚠️ {symbol} momentum OK mais tendance baissière — skip")
+                                log.info(f"⚠️ {symbol} tendance baissière — skip")
                                 continue
 
                             rsi = get_rsi(symbol)
@@ -203,7 +197,7 @@ def run():
                                 log.info(f"⚠️ {symbol} RSI surachat ({round(rsi,1)}) — skip")
                                 continue
 
-                            log.info(f"🎯 Signal {symbol} | Momentum: {round(momentum,3)}% | RSI: {round(rsi,1)} | Achat!")
+                            log.info(f"🎯 {symbol} | Momentum: {round(momentum,3)}% | RSI: {round(rsi,1)} | Achat!")
                             pos = buy(symbol, price)
                             if pos:
                                 positions[symbol] = pos
@@ -212,7 +206,7 @@ def run():
                     log.error(f"Erreur {symbol}: {e}")
                     continue
 
-            log.info(f"📈 Positions: {len(positions)}/{len(SYMBOLS)} | PnL jour: {round(daily_pnl, 2)}$")
+            log.info(f"📈 Positions: {len(positions)}/{len(SYMBOLS)} | PnL: {round(daily_pnl, 2)}$")
 
         except Exception as e:
             log.error(f"Erreur globale: {e}")
