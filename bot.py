@@ -15,14 +15,6 @@ MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BASE_BET = float(os.getenv("BASE_BET", "3"))
 MAX_BET = float(os.getenv("MAX_BET", "50"))
 
-# ── Nouveaux filtres (variables Railway optionnelles) ────────────────────────
-# Pente minimum sur 15min pour considérer une vraie tendance
-BTC_TREND_MIN = float(os.getenv("BTC_TREND_MIN", "100"))
-# Nombre de confirmations consécutives requises avant d'entrer
-CONFIRM_COUNT = int(os.getenv("CONFIRM_COUNT", "2"))
-# Prix maximum accepté pour entrer (évite d'acheter trop cher)
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.65"))
-
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
@@ -100,7 +92,6 @@ def calculate_bet_size_kelly(slope):
     return bet
 
 def get_btc_slope():
-    """Pente BTC sur 5 bougies 1 minute (court terme)"""
     try:
         r = requests.get(
             BINANCE_API + "/api/v3/klines",
@@ -118,48 +109,12 @@ def get_btc_slope():
         log.error("Erreur courbe BTC: " + str(e))
         return 0
 
-def get_btc_trend_15m():
-    """
-    NOUVEAU — Tendance BTC sur 15 bougies 1 minute.
-    Retourne (direction, amplitude) :
-      direction = 'up' | 'down' | 'range'
-      amplitude = variation totale en $
-    """
-    try:
-        r = requests.get(
-            BINANCE_API + "/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 15},
-            timeout=10
-        )
-        if not r.ok:
-            return "range", 0
-        candles = r.json()
-        closes  = [float(c[4]) for c in candles]
-        amp     = closes[-1] - closes[0]
-        # EMA5 vs EMA15 pour confirmer la tendance
-        ema5    = sum(closes[-5:]) / 5
-        ema15   = sum(closes) / 15
-        if amp > BTC_TREND_MIN and ema5 > ema15:
-            direction = "up"
-        elif amp < -BTC_TREND_MIN and ema5 < ema15:
-            direction = "down"
-        else:
-            direction = "range"
-        log.info("Tendance 15m: " + direction + " | Amplitude: " + str(round(amp)) + "$ | EMA5: " + str(round(ema5)) + " EMA15: " + str(round(ema15)))
-        return direction, amp
-    except Exception as e:
-        log.error("Erreur tendance 15m: " + str(e))
-        return "range", 0
-
 daily_pnl      = load_daily_pnl()
 pnl_date       = date.today()
 seen_trades    = set()
 traded_windows = set()
 open_positions = []
 positions_lock = threading.Lock()
-
-# Compteur de confirmations consécutives
-signal_confirmations = {"Up": 0, "Down": 0}
 
 def load_traded_markets():
     try:
@@ -430,10 +385,9 @@ def monitor_loop():
         time.sleep(MONITOR_INTERVAL)
 
 def run():
-    global daily_pnl, pnl_date, traded_markets, signal_confirmations
-    log.info("Bot Smart v2 - Pente + Kelly + Tendance 15m + Confirmation")
+    global daily_pnl, pnl_date, traded_markets
+    log.info("Bot Smart v1 - Pente + Kelly + Monitor 30s")
     log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
-    log.info("Filtre tendance: " + str(BTC_TREND_MIN) + "$ | Confirmations: " + str(CONFIRM_COUNT) + " | Prix max: " + str(MAX_ENTRY_PRICE))
     log.info("PnL chargé: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -455,7 +409,6 @@ def run():
                 pnl_date  = today
                 seen_trades.clear()
                 traded_windows.clear()
-                signal_confirmations = {"Up": 0, "Down": 0}
                 save_daily_pnl(0.0)
 
             if check_stop_loss():
@@ -494,7 +447,7 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m - Pente + Tendance 15m + Confirmation
+            # STRATEGIE 2 : BTC 5m - Pente pure
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
                 now               = int(time.time())
@@ -518,45 +471,20 @@ def run():
 
                     slope       = get_btc_slope()
                     btc_current = get_btc_price()
+                    market      = get_btc_market(window_ts)
 
-                    # ── FILTRE 1 : Tendance 15 minutes ──────────────────────
-                    trend_dir, trend_amp = get_btc_trend_15m()
+                    if market:
+                        if slope > 25:
+                            target = "Up"
+                            log.info("Signal UP +" + str(round(slope)) + "$")
+                        elif slope < -25:
+                            target = "Down"
+                            log.info("Signal DOWN " + str(round(slope)) + "$")
+                        else:
+                            target = None
+                            log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
 
-                    if slope > 25:
-                        raw_signal = "Up"
-                    elif slope < -25:
-                        raw_signal = "Down"
-                    else:
-                        raw_signal = None
-
-                    # Reset confirmations si signal change de sens
-                    if raw_signal == "Up":
-                        signal_confirmations["Down"] = 0
-                        signal_confirmations["Up"] += 1
-                    elif raw_signal == "Down":
-                        signal_confirmations["Up"] = 0
-                        signal_confirmations["Down"] += 1
-                    else:
-                        signal_confirmations = {"Up": 0, "Down": 0}
-
-                    log.info("Signal brut: " + str(raw_signal) + " | Confirmations: Up=" + str(signal_confirmations["Up"]) + " Down=" + str(signal_confirmations["Down"]))
-
-                    # ── FILTRE 2 : Alignement tendance + confirmations ───────
-                    target = None
-                    if raw_signal == "Up" and trend_dir == "up" and signal_confirmations["Up"] >= CONFIRM_COUNT:
-                        target = "Up"
-                        log.info("✅ Signal UP confirmé | Pente: +" + str(round(slope)) + "$ | Tendance 15m: +" + str(round(trend_amp)) + "$")
-                    elif raw_signal == "Down" and trend_dir == "down" and signal_confirmations["Down"] >= CONFIRM_COUNT:
-                        target = "Down"
-                        log.info("✅ Signal DOWN confirmé | Pente: " + str(round(slope)) + "$ | Tendance 15m: " + str(round(trend_amp)) + "$")
-                    elif raw_signal:
-                        log.info("⏳ Signal " + raw_signal + " pas encore confirmé ou tendance non alignée (tendance: " + trend_dir + ") - on attend")
-                    else:
-                        log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
-
-                    if target:
-                        market = get_btc_market(window_ts)
-                        if market:
+                        if target:
                             bet_size = calculate_bet_size_kelly(slope)
                             for token in market.get("tokens", []):
                                 if token["outcome"] == target:
@@ -564,17 +492,10 @@ def run():
                                     price    = get_token_price(token_id)
                                     if price <= 0:
                                         price = 0.5
-
-                                    # ── FILTRE 3 : Prix maximum d'entrée ────
-                                    if price > MAX_ENTRY_PRICE:
-                                        log.info("⚠️ Prix trop élevé (" + str(round(price, 2)) + ") > max " + str(MAX_ENTRY_PRICE) + " - skip")
-                                        continue
-
                                     log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.20 <= price <= MAX_ENTRY_PRICE:
+                                    if 0.50 <= price <= 0.80:
                                         if place_order(token_id, target, price, bet_size, btc_current, slope):
                                             traded_windows.add(window_ts)
-                                            signal_confirmations = {"Up": 0, "Down": 0}
                                     else:
                                         log.info("Prix hors fourchette: " + str(round(price, 2)))
 
