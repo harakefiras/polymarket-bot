@@ -1,281 +1,122 @@
-import os, time, logging, requests, hashlib, hmac, math, json
-from datetime import date
+import os, time, logging, requests
+from datetime import datetime
+from binance.client import Client
+from binance.enums import *
 
 BINANCE_API_KEY = os.environ.get("BINANCE_API_KEY", "")
 BINANCE_SECRET_KEY = os.environ.get("BINANCE_SECRET_KEY", "")
-DAILY_STOP_LOSS = float(os.getenv("BINANCE_STOP_LOSS", "50"))
-STOP_LOSS_PCT = float(os.getenv("GRID_STOP_LOSS_PCT", "0.05"))
-GRID_LEVELS = int(os.getenv("GRID_LEVELS", "10"))
-GRID_SPACING_PCT = float(os.getenv("GRID_SPACING_PCT", "0.003"))
-USDT_PER_LEVEL = float(os.getenv("USDT_PER_LEVEL", "30"))
-POLL_INTERVAL = float(os.getenv("BINANCE_POLL_INTERVAL", "30"))
-
-BASE_URL = "https://api.binance.com"
-GRID_FILE = "/app/grid_state.json"
+SYMBOL = "BNBUSDT"
+TRADE_AMOUNT_USDT = float(os.getenv("TRADE_AMOUNT_USDT", "200"))
+TARGET_PROFIT_PCT = float(os.getenv("TARGET_PROFIT_PCT", "0.003"))
+STOP_LOSS_PCT = float(os.getenv("STOP_LOSS_PCT", "0.002"))
+DAILY_STOP_LOSS = float(os.getenv("DAILY_STOP_LOSS", "50"))
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
-log = logging.getLogger("grid_bot")
+log = logging.getLogger("binance_bot")
+
+client = Client(BINANCE_API_KEY, BINANCE_SECRET_KEY)
 
 daily_pnl = 0.0
-pnl_date = date.today()
-grids = {}
+position = None
 
-def sign(params):
-    query = "&".join([str(k) + "=" + str(v) for k, v in params.items()])
-    signature = hmac.new(
-        BINANCE_SECRET_KEY.encode("utf-8"),
-        query.encode("utf-8"),
-        hashlib.sha256
-    ).hexdigest()
-    return query + "&signature=" + signature
-
-def get_headers():
-    return {"X-MBX-APIKEY": BINANCE_API_KEY}
-
-def get_price(symbol):
+def get_bnb_price():
     try:
-        r = requests.get(BASE_URL + "/api/v3/ticker/price", params={"symbol": symbol}, timeout=10)
-        if r.ok:
-            return float(r.json().get("price", 0))
-        return 0
-    except:
+        ticker = client.get_symbol_ticker(symbol=SYMBOL)
+        return float(ticker["price"])
+    except Exception as e:
+        log.error("Erreur prix: " + str(e))
         return 0
 
-def get_lot_size(symbol):
+def get_bnb_momentum():
     try:
-        r = requests.get(BASE_URL + "/api/v3/exchangeInfo", params={"symbol": symbol}, timeout=10)
-        if r.ok:
-            filters = r.json()["symbols"][0]["filters"]
-            for f in filters:
-                if f["filterType"] == "LOT_SIZE":
-                    return float(f["stepSize"]), float(f["minQty"])
-        return 0.001, 0.001
-    except:
-        return 0.001, 0.001
-
-def round_qty(qty, step):
-    precision = len(str(step).rstrip("0").split(".")[-1]) if "." in str(step) else 0
-    return round(math.floor(qty / step) * step, precision)
-
-def get_open_orders(symbol):
-    try:
-        ts = int(time.time() * 1000)
-        params = {"symbol": symbol, "timestamp": ts}
-        query = sign(params)
-        r = requests.get(BASE_URL + "/api/v3/openOrders?" + query, headers=get_headers(), timeout=10)
-        if r.ok:
-            return r.json()
-        return []
-    except:
-        return []
-
-def cancel_all_orders(symbol):
-    try:
-        ts = int(time.time() * 1000)
-        params = {"symbol": symbol, "timestamp": ts}
-        query = sign(params)
-        r = requests.delete(BASE_URL + "/api/v3/openOrders?" + query, headers=get_headers(), timeout=10)
-        return r.ok
-    except:
-        return False
-
-def save_grid_state():
-    try:
-        state = {}
-        for symbol, grid in grids.items():
-            state[symbol] = {
-                "entry_price": grid["entry_price"],
-                "stop_loss": grid["stop_loss"],
-                "pnl": grid["pnl"],
-                "levels": [{
-                    "buy_price": l["buy_price"],
-                    "sell_price": l["sell_price"],
-                    "buy_order": l["buy_order"],
-                    "sell_order": l["sell_order"],
-                    "filled_buy": l["filled_buy"],
-                } for l in grid["levels"]]
-            }
-        with open(GRID_FILE, "w") as f:
-            json.dump(state, f)
+        candles = client.get_klines(symbol=SYMBOL, interval=Client.KLINE_INTERVAL_1MINUTE, limit=3)
+        closes = [float(c[4]) for c in candles]
+        move = (closes[-1] - closes[0]) / closes[0] * 100
+        log.info("BNB momentum 1m: " + str(round(move, 3)) + "%")
+        return move
     except Exception as e:
-        log.error("Erreur save grid: " + str(e))
+        log.error("Erreur momentum: " + str(e))
+        return 0
 
-def place_order(symbol, side, price, usdt_amount):
+def buy_bnb(price):
     try:
-        current_price = get_price(symbol)
-        step, min_qty = get_lot_size(symbol)
-        qty = round_qty(usdt_amount / current_price, step)
-
-        if qty < min_qty:
-            log.warning("Quantite trop petite: " + str(qty))
-            return None
-
-        ts = int(time.time() * 1000)
-        params = {
-            "symbol": symbol,
-            "side": side,
-            "type": "LIMIT",
-            "timeInForce": "GTC",
-            "quantity": qty,
-            "price": round(price, 2),
-            "timestamp": ts
-        }
-        query = sign(params)
-        r = requests.post(BASE_URL + "/api/v3/order?" + query, headers=get_headers(), timeout=10)
-        if r.ok:
-            order = r.json()
-            log.info(side + " " + symbol + " | Qty: " + str(qty) + " @ " + str(round(price, 2)))
-            return order
-        else:
-            log.error("Erreur ordre: " + str(r.text[:100]))
-            return None
+        qty = round(TRADE_AMOUNT_USDT / price, 2)
+        order = client.order_market_buy(symbol=SYMBOL, quantity=qty)
+        log.info("ACHAT BNB | Qty: " + str(qty) + " @ " + str(round(price, 2)))
+        return {"qty": qty, "entry": price}
     except Exception as e:
-        log.error("Exception ordre: " + str(e))
+        log.error("Erreur achat: " + str(e))
         return None
 
-def check_order_filled(order_id, symbol):
+def sell_bnb(qty, reason):
     try:
-        ts = int(time.time() * 1000)
-        params = {"symbol": symbol, "orderId": order_id, "timestamp": ts}
-        query = sign(params)
-        r = requests.get(BASE_URL + "/api/v3/order?" + query, headers=get_headers(), timeout=10)
-        if r.ok:
-            return r.json().get("status") == "FILLED"
-        return False
-    except:
-        return False
-
-def cancel_order(order_id, symbol):
-    try:
-        ts = int(time.time() * 1000)
-        params = {"symbol": symbol, "orderId": order_id, "timestamp": ts}
-        query = sign(params)
-        r = requests.delete(BASE_URL + "/api/v3/order?" + query, headers=get_headers(), timeout=10)
-        return r.ok
-    except:
-        return False
-
-def setup_grid(symbol, current_price):
-    existing_orders = get_open_orders(symbol)
-    if existing_orders:
-        log.info(symbol + " - " + str(len(existing_orders)) + " ordres existants - annulation...")
-        cancel_all_orders(symbol)
-        time.sleep(2)
-
-    log.info("Setup grille " + symbol + " @ " + str(round(current_price, 2)))
-    stop_loss_price = current_price * (1 - STOP_LOSS_PCT)
-
-    levels = []
-    for i in range(1, GRID_LEVELS + 1):
-        buy_price = current_price * (1 - i * GRID_SPACING_PCT)
-        sell_price = current_price * (1 + i * GRID_SPACING_PCT)
-        levels.append({
-            "buy_price": round(buy_price, 2),
-            "sell_price": round(sell_price, 2),
-            "buy_order": None,
-            "sell_order": None,
-            "filled_buy": False,
-        })
-
-    for level in levels:
-        order = place_order(symbol, "BUY", level["buy_price"], USDT_PER_LEVEL)
-        if order:
-            level["buy_order"] = order.get("orderId")
-        time.sleep(0.5)
-
-    grids[symbol] = {
-        "levels": levels,
-        "entry_price": current_price,
-        "stop_loss": stop_loss_price,
-        "pnl": 0.0
-    }
-    save_grid_state()
-    log.info("Grille " + symbol + " configuree | Stop-loss: " + str(round(stop_loss_price, 2)))
-
-def manage_grid(symbol):
-    global daily_pnl
-
-    if symbol not in grids:
-        return
-
-    grid = grids[symbol]
-    current_price = get_price(symbol)
-
-    if current_price <= 0:
-        return
-
-    log.info(symbol + " @ " + str(round(current_price, 2)) + " | Grid PnL: " + str(round(grid["pnl"], 2)) + " USDT")
-
-    if current_price <= grid["stop_loss"]:
-        log.warning("STOP LOSS " + symbol + "!")
-        cancel_all_orders(symbol)
-        del grids[symbol]
-        save_grid_state()
-        return
-
-    for level in grid["levels"]:
-        if level["buy_order"] and not level["filled_buy"]:
-            if check_order_filled(level["buy_order"], symbol):
-                log.info("BUY rempli @ " + str(level["buy_price"]) + " -> SELL @ " + str(level["sell_price"]))
-                level["filled_buy"] = True
-                sell_ord = place_order(symbol, "SELL", level["sell_price"], USDT_PER_LEVEL)
-                if sell_ord:
-                    level["sell_order"] = sell_ord.get("orderId")
-                save_grid_state()
-
-        if level["sell_order"] and level["filled_buy"]:
-            if check_order_filled(level["sell_order"], symbol):
-                profit = USDT_PER_LEVEL * GRID_SPACING_PCT * 2
-                grid["pnl"] += profit
-                daily_pnl += profit
-                log.info("PROFIT " + symbol + " +" + str(round(profit, 3)) + " USDT | Total: " + str(round(grid["pnl"], 2)))
-                level["filled_buy"] = False
-                level["sell_order"] = None
-                buy_ord = place_order(symbol, "BUY", level["buy_price"], USDT_PER_LEVEL)
-                if buy_ord:
-                    level["buy_order"] = buy_ord.get("orderId")
-                save_grid_state()
+        order = client.order_market_sell(symbol=SYMBOL, quantity=qty)
+        price = get_bnb_price()
+        log.info("VENTE " + reason + " | Qty: " + str(qty) + " @ " + str(round(price, 2)))
+        return price
+    except Exception as e:
+        log.error("Erreur vente: " + str(e))
+        return 0
 
 def run():
-    global daily_pnl, pnl_date
+    global daily_pnl, position
+    log.info("Bot Scalping BNB demarre!")
+    log.info("Mise: " + str(TRADE_AMOUNT_USDT) + "$ | TP: " + str(TARGET_PROFIT_PCT*100) + "% | SL: " + str(STOP_LOSS_PCT*100) + "%")
 
-    log.info("Bot Grid BNB demarre!")
-    log.info("Niveaux: " + str(GRID_LEVELS) + " | Espacement: " + str(GRID_SPACING_PCT * 100) + "% | USDT/niveau: " + str(USDT_PER_LEVEL) + " | Stop-loss: " + str(STOP_LOSS_PCT * 100) + "%")
-
-    if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-        log.error("Cles API manquantes!")
+    if not BINANCE_API_KEY:
+        log.error("BINANCE_API_KEY manquante!")
         return
-
-    price = get_price("BNBUSDT")
-    if price > 0:
-        setup_grid("BNBUSDT", price)
 
     while True:
         try:
-            today = date.today()
-            if today != pnl_date:
-                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
-                daily_pnl = 0.0
-                pnl_date = today
-
             if daily_pnl <= -DAILY_STOP_LOSS:
-                log.warning("Stop-loss journalier! Pause 1h.")
+                log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
                 daily_pnl = 0.0
                 continue
 
-            log.info("PnL jour: " + str(round(daily_pnl, 2)) + " | Grilles: " + str(len(grids)))
-            manage_grid("BNBUSDT")
+            price = get_bnb_price()
+            if price <= 0:
+                time.sleep(5)
+                continue
 
-            if "BNBUSDT" not in grids:
-                price = get_price("BNBUSDT")
-                if price > 0:
-                    setup_grid("BNBUSDT", price)
+            # Pas de position ouverte — cherche signal
+            if position is None:
+                momentum = get_bnb_momentum()
+
+                if momentum >= 0.2:
+                    log.info("Signal UP fort! Achat...")
+                    position = buy_bnb(price)
+
+                elif momentum <= -0.2:
+                    log.info("Momentum négatif - on attend")
+
+            # Position ouverte — surveille TP et SL
+            else:
+                entry = position["entry"]
+                qty   = position["qty"]
+                pct   = (price - entry) / entry
+
+                log.info("Position | Entry: " + str(round(entry, 2)) + " | Now: " + str(round(price, 2)) + " | PnL: " + str(round(pct*100, 3)) + "%")
+
+                if pct >= TARGET_PROFIT_PCT:
+                    sell_price = sell_bnb(qty, "TP")
+                    pnl = (sell_price - entry) * qty
+                    daily_pnl += pnl
+                    log.info("GAIN! +" + str(round(pnl, 2)) + "$ | Total: " + str(round(daily_pnl, 2)) + "$")
+                    position = None
+
+                elif pct <= -STOP_LOSS_PCT:
+                    sell_price = sell_bnb(qty, "SL")
+                    pnl = (sell_price - entry) * qty
+                    daily_pnl += pnl
+                    log.info("STOP LOSS | " + str(round(pnl, 2)) + "$ | Total: " + str(round(daily_pnl, 2)) + "$")
+                    position = None
 
         except Exception as e:
             log.error("Erreur: " + str(e))
 
-        time.sleep(POLL_INTERVAL)
+        time.sleep(30)
 
 if __name__ == "__main__":
-    log.info("Bot Binance en pause")
+    run()
