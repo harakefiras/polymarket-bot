@@ -26,7 +26,6 @@ positions_lock = threading.Lock()
 window_ref_prices = {}
 traded_windows = set()
 
-# ─── PERSISTANCE PNL ─────────────────────────────────────
 def load_daily_pnl():
     try:
         if os.path.exists(PNL_FILE):
@@ -45,7 +44,6 @@ def save_daily_pnl(pnl):
     except:
         pass
 
-# ─── HISTORIQUE TRADES ───────────────────────────────────
 def load_history():
     try:
         if os.path.exists(TRADES_FILE):
@@ -74,38 +72,27 @@ def save_trade(result, gap, entry_price, pnl):
     except Exception as e:
         log.error("Erreur save trade: " + str(e))
 
-# ─── APPRENTISSAGE ───────────────────────────────────────
 def get_smart_params():
     history = load_history()
     if len(history) < 10:
         return MIN_GAP, BASE_BET
-
     wins = [t for t in history if t["result"] == "win"]
-    losses = [t for t in history if t["result"] == "loss"]
     win_rate = len(wins) / len(history)
-
-    # Calcule le meilleur seuil gap basé sur l'historique
-    best_gap = MIN_GAP
     if len(wins) >= 5:
         win_gaps = [abs(t["gap"]) for t in wins]
         best_gap = max(MIN_GAP, sum(win_gaps) / len(win_gaps) * 0.7)
         best_gap = min(best_gap, 100)
-
-    # Mise adaptative selon win rate
+    else:
+        best_gap = MIN_GAP
     if win_rate >= 0.65:
         bet = min(BASE_BET * 3, MAX_BET)
-        log.info("Win rate " + str(round(win_rate*100)) + "% - Mise x3: " + str(bet))
     elif win_rate >= 0.55:
         bet = min(BASE_BET * 2, MAX_BET)
-        log.info("Win rate " + str(round(win_rate*100)) + "% - Mise x2: " + str(bet))
     else:
         bet = BASE_BET
-        log.info("Win rate " + str(round(win_rate*100)) + "% - Mise base: " + str(bet))
-
-    log.info("Params appris: gap_min=" + str(round(best_gap)) + "$ | mise=" + str(bet) + " USDC | " + str(len(history)) + " trades")
+    log.info("Smart params | gap=" + str(round(best_gap)) + "$ | mise=" + str(bet) + " | WR=" + str(round(win_rate*100)) + "% | " + str(len(history)) + " trades")
     return best_gap, bet
 
-# ─── PRIX BTC ────────────────────────────────────────────
 def get_btc_price():
     try:
         r = requests.get(BINANCE_API + "/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=10)
@@ -115,7 +102,6 @@ def get_btc_price():
     except:
         return 0
 
-# ─── PRIX TOKEN ──────────────────────────────────────────
 def get_token_price(token_id):
     try:
         r = requests.get(CLOB_API + "/last-trade-price", params={"token_id": token_id}, timeout=10)
@@ -125,7 +111,6 @@ def get_token_price(token_id):
     except:
         return 0
 
-# ─── MARCHE BTC 5M ───────────────────────────────────────
 def get_btc_market(window_ts):
     try:
         slug = "btc-updown-5m-" + str(window_ts)
@@ -144,7 +129,6 @@ def get_btc_market(window_ts):
         log.error("Erreur marche: " + str(e))
         return None
 
-# ─── ORDRES ──────────────────────────────────────────────
 async def place_order_async(token_id, outcome, price, btc_ref, gap, bet):
     try:
         from polymarket import AsyncSecureClient
@@ -158,13 +142,9 @@ async def place_order_async(token_id, outcome, price, btc_ref, gap, bet):
                 log.info("TRADE " + outcome + " " + str(bet) + " USDC @ " + str(round(price, 2)) + " | Gap: " + str(round(gap)) + "$")
                 with positions_lock:
                     open_positions.append({
-                        "token_id": token_id,
-                        "entry_price": price,
-                        "shares": shares,
-                        "size": bet,
-                        "side": outcome,
-                        "btc_ref": btc_ref,
-                        "gap": gap
+                        "token_id": token_id, "entry_price": price,
+                        "shares": shares, "size": bet,
+                        "side": outcome, "btc_ref": btc_ref, "gap": gap
                     })
                 return True
             log.error("Erreur ordre: " + str(response.message))
@@ -195,7 +175,6 @@ async def sell_order_async(token_id, shares, reason, price):
 def sell_order(token_id, shares, reason, price):
     return asyncio.run(sell_order_async(token_id, shares, reason, price))
 
-# ─── MONITOR 30S ─────────────────────────────────────────
 def monitor_loop():
     global daily_pnl
     log.info("Monitor 30s demarre")
@@ -214,7 +193,6 @@ def monitor_loop():
                     shares = pos["shares"]
                     side = pos["side"]
                     log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
-
                     if current >= 0.98:
                         pnl = (1.0 - entry) * shares
                         daily_pnl += pnl
@@ -222,7 +200,6 @@ def monitor_loop():
                         save_trade("win", pos["gap"], entry, pnl)
                         log.info("GAIN! +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
-
                     elif current <= 0.02:
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
@@ -230,7 +207,6 @@ def monitor_loop():
                         save_trade("loss", pos["gap"], entry, pnl)
                         log.info("PERTE | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
-
                     elif current <= STOP_LOSS_PRICE:
                         if sell_order(pos["token_id"], shares, "SL", current):
                             pnl = (current - entry) * shares
@@ -239,7 +215,6 @@ def monitor_loop():
                             save_trade("loss", pos["gap"], entry, pnl)
                             log.info("STOP LOSS | Total: " + str(round(daily_pnl, 2)))
                             to_remove.append(pos)
-
                     elif pos["btc_ref"] > 0 and btc_current > 0:
                         if side == "Up" and btc_current < pos["btc_ref"] - BTC_DEVIATION:
                             if sell_order(pos["token_id"], shares, "SL_BTC", current):
@@ -255,7 +230,6 @@ def monitor_loop():
                                 save_daily_pnl(daily_pnl)
                                 save_trade("loss", pos["gap"], entry, pnl)
                                 to_remove.append(pos)
-
                 with positions_lock:
                     for pos in to_remove:
                         if pos in open_positions:
@@ -264,7 +238,6 @@ def monitor_loop():
             log.error("Monitor erreur: " + str(e))
         time.sleep(30)
 
-# ─── THREAD PRIX REFERENCE ───────────────────────────────
 def ref_price_loop():
     log.info("Thread prix reference demarre")
     while True:
@@ -277,21 +250,19 @@ def ref_price_loop():
                     price = get_btc_price()
                     if price > 0:
                         window_ref_prices[window_ts] = price
-                        log.info("Ref | Fenetre " + str(window_ts) + " | BTC: " + str(round(price)))
-                    for k in list(window_ref_prices.keys()):
-                        if k < window_ts - 600:
-                            del window_ref_prices[k]
+                        log.info("Ref | " + str(window_ts) + " | " + str(round(price)))
+                for k in list(window_ref_prices.keys()):
+                    if k < now - 600:
+                        del window_ref_prices[k]
         except Exception as e:
             log.error("Ref erreur: " + str(e))
         time.sleep(1)
 
-# ─── BOUCLE PRINCIPALE ───────────────────────────────────
 def run():
     global daily_pnl, traded_windows
     daily_pnl = load_daily_pnl()
-    log.info("Bot Evolutif v1 demarre!")
-    log.info("SL jour: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | SL trade: " + str(STOP_LOSS_PRICE))
-    log.info("PnL charge: " + str(round(daily_pnl, 2)))
+    log.info("Bot Evolutif v2 demarre!")
+    log.info("SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | SL trade: " + str(STOP_LOSS_PRICE) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -302,10 +273,8 @@ def run():
 
     while True:
         try:
-            today = date.today()
-
             if daily_pnl <= -STOP_LOSS_USDC:
-                log.warning("Stop-loss journalier atteint! Pause 1h.")
+                log.warning("Stop-loss! Pause 1h.")
                 time.sleep(3600)
                 daily_pnl = 0.0
                 traded_windows.clear()
@@ -317,69 +286,81 @@ def run():
 
             log.info("Positions: " + str(round(open_val, 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            if open_val < MAX_OPEN_USDC:
-                now = int(time.time())
-                sec = now % 300
-                window_ts = now - sec
+            if open_val >= MAX_OPEN_USDC:
+                time.sleep(30)
+                continue
 
-                if window_ts in traded_windows:
-                    log.info("Fenetre deja tradee - attente prochaine")
-                    time.sleep(300 - sec + 5)
-                    continue
+            now = int(time.time())
+            sec = now % 300
+            window_ts = now - sec
 
-                if sec > 120:
-                    wait = 300 - sec
-                    log.info("Trop tard (" + str(sec) + "s) - attente " + str(wait) + "s")
-                    time.sleep(wait)
-                    now = int(time.time())
-                    window_ts = now - (now % 300)
-                    sec = 0
+            if window_ts in traded_windows:
+                wait = 300 - sec + 5
+                log.info("Fenetre tradee - attente " + str(wait) + "s")
+                time.sleep(wait)
+                continue
 
-                if sec < 60:
-                    wait = 60 - sec
-                    log.info("Stabilisation " + str(wait) + "s...")
-                    time.sleep(wait)
+            if sec > 120:
+                wait = 300 - sec + 5
+                log.info("Trop tard (" + str(sec) + "s) - attente " + str(wait) + "s")
+                time.sleep(wait)
+                continue
 
-                ref_price = window_ref_prices.get(window_ts, 0)
-                btc_current = get_btc_price()
-                min_gap, bet_size = get_smart_params()
+            if sec < 60:
+                wait = 60 - sec
+                log.info("Stabilisation " + str(wait) + "s...")
+                time.sleep(wait)
 
-                log.info("Ref: " + str(round(ref_price)) + "$ | BTC: " + str(round(btc_current)) + "$ | Seuil: " + str(round(min_gap)) + "$")
+            now = int(time.time())
+            sec = now % 300
+            window_ts = now - sec
 
-                if ref_price > 0 and btc_current > 0:
-                    gap = btc_current - ref_price
+            ref_price = window_ref_prices.get(window_ts, 0)
 
-                    if gap >= min_gap:
-                        target = "Up"
-                        log.info("Signal UP +" + str(round(gap)) + "$")
-                    elif gap <= -min_gap:
-                        target = "Down"
-                        log.info("Signal DOWN " + str(round(gap)) + "$")
-                    else:
-                        target = None
-                        log.info("Gap " + str(round(gap)) + "$ < seuil " + str(round(min_gap)) + "$ - pas de trade")
+            if ref_price == 0:
+                ref_price = get_btc_price()
+                if ref_price > 0:
+                    window_ref_prices[window_ts] = ref_price
+                    log.info("Ref enregistree maintenant: " + str(round(ref_price)))
 
-                    if target:
-                        market = get_btc_market(window_ts)
-                        if market:
-                            for token in market.get("tokens", []):
-                                if token["outcome"] == target:
-                                    price = get_token_price(token["token_id"])
-                                    if price <= 0:
-                                        price = 0.5
-                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.45 <= price <= 0.65:
-                                        if place_order(token["token_id"], target, price, ref_price, gap, bet_size):
-                                            traded_windows.add(window_ts)
-                                    else:
-                                        log.info("Prix hors fourchette: " + str(round(price, 2)))
+            btc_current = get_btc_price()
+            min_gap, bet_size = get_smart_params()
+
+            log.info("Ref: " + str(round(ref_price)) + "$ | BTC: " + str(round(btc_current)) + "$ | Seuil: " + str(round(min_gap)) + "$")
+
+            if ref_price > 0 and btc_current > 0:
+                gap = btc_current - ref_price
+                log.info("Gap: " + str(round(gap)) + "$")
+
+                if gap >= min_gap:
+                    target = "Up"
+                    log.info("Signal UP +" + str(round(gap)) + "$")
+                elif gap <= -min_gap:
+                    target = "Down"
+                    log.info("Signal DOWN " + str(round(gap)) + "$")
                 else:
-                    log.info("Prix reference pas disponible")
+                    target = None
+                    log.info("Gap insuffisant - pas de trade")
+
+                if target:
+                    market = get_btc_market(window_ts)
+                    if market:
+                        for token in market.get("tokens", []):
+                            if token["outcome"] == target:
+                                price = get_token_price(token["token_id"])
+                                if price <= 0:
+                                    price = 0.5
+                                log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size))
+                                if 0.45 <= price <= 0.65:
+                                    if place_order(token["token_id"], target, price, ref_price, gap, bet_size):
+                                        traded_windows.add(window_ts)
+                                else:
+                                    log.info("Prix hors fourchette: " + str(round(price, 2)))
 
         except Exception as e:
-            log.error("Erreur principale: " + str(e))
+            log.error("Erreur: " + str(e))
 
-        time.sleep(300)
+        time.sleep(30)
 
 if __name__ == "__main__":
     run()
