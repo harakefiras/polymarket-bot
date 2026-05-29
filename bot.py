@@ -18,7 +18,7 @@ ARB_MAX_SUM = float(os.getenv("ARB_MAX_SUM", "0.96"))
 ARB_BET = float(os.getenv("ARB_BET", "10"))
 DAILY_TAKE_PROFIT = float(os.getenv("DAILY_TAKE_PROFIT", "40"))
 
-ACTIVE_HOURS = list(range(7, 19))
+ACTIVE_HOURS = list(range(7, 22))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -552,7 +552,7 @@ def run():
                         price = get_token_price(w["token_id"])
                         if price <= 0:
                             price = w["price"]
-                        if 0.45 <= price <= 0.65:
+                        if 0.45 <= price <= 0.75:
                             btc_now = get_btc_price()
                             if place_order(w["token_id"], w["outcome"], price, 5.0, btc_now):
                                 seen_trades.add(w["id"])
