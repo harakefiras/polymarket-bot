@@ -7,17 +7,18 @@ WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "20"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "50"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
-MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
-STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
-WHALE_MAX_HOURS = float(os.getenv("WHALE_MAX_HOURS", "72"))
+MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "100"))
+STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.25"))
+WHALE_MAX_HOURS = float(os.getenv("WHALE_MAX_HOURS", "120"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BASE_BET = float(os.getenv("BASE_BET", "3"))
 MAX_BET = float(os.getenv("MAX_BET", "50"))
-ARB_MAX_SUM = float(os.getenv("ARB_MAX_SUM", "0.94"))
+ARB_MAX_SUM = float(os.getenv("ARB_MAX_SUM", "0.96"))
 ARB_BET = float(os.getenv("ARB_BET", "10"))
+DAILY_TAKE_PROFIT = float(os.getenv("DAILY_TAKE_PROFIT", "40"))
 
-ACTIVE_HOURS = list(range(7, 23))
+ACTIVE_HOURS = list(range(7, 19))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -142,6 +143,9 @@ traded_markets = load_traded_markets()
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
 
+def check_take_profit():
+    return daily_pnl >= DAILY_TAKE_PROFIT
+
 def open_val():
     with positions_lock:
         return sum(p["size"] for p in open_positions)
@@ -232,14 +236,12 @@ def detect_whales(markets):
     return whales
 
 def get_midpoint_price(token_id):
-    """Récupère le prix mid du orderbook (plus fiable que last-trade-price pour ARB)."""
     try:
         r = requests.get(CLOB_API + "/midpoint", params={"token_id": token_id}, timeout=10)
         if r.ok:
             mid = float(r.json().get("mid", 0))
             if mid > 0:
                 return mid
-        # Fallback sur last-trade-price si midpoint indispo
         r2 = requests.get(CLOB_API + "/last-trade-price", params={"token_id": token_id}, timeout=10)
         if r2.ok:
             return float(r2.json().get("price", 1))
@@ -258,10 +260,7 @@ def find_arb_opportunities(markets):
             token_ids = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
             if len(outcomes) != 2 or len(token_ids) != 2:
                 continue
-
-            # Utilise le midpoint (prix orderbook temps réel) au lieu du last-trade-price
             prices = [get_midpoint_price(tid) for tid in token_ids]
-
             if len(prices) == 2:
                 total = prices[0] + prices[1]
                 profit = 1 - total
@@ -480,9 +479,9 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v5 - Pente + Kelly + Whales 72h + ARB YES/NO midpoint + fix asyncio")
+    log.info("Bot Smart v6 - Kelly + ARB + Whales 120h + TP journalier 40$ + 7h-19h UTC")
     log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
-    log.info("ARB: mise " + str(ARB_BET) + " USDC | seuil " + str(ARB_MAX_SUM))
+    log.info("ARB: mise " + str(ARB_BET) + " USDC | seuil " + str(ARB_MAX_SUM) + " | TP jour: " + str(DAILY_TAKE_PROFIT))
     log.info("PnL chargé: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -508,20 +507,27 @@ def run():
                 save_daily_pnl(0.0)
 
             if check_stop_loss():
-                log.warning("Stop-loss atteint! Pause 1h.")
+                log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
+                daily_pnl = 0.0
+                save_daily_pnl(0.0)
+                continue
+
+            if check_take_profit():
+                log.info("TAKE PROFIT JOURNALIER! +" + str(round(daily_pnl, 2)) + " USDC - Pause jusqu'a demain!")
+                time.sleep(3600 * 8)
                 continue
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
             markets = get_active_markets(max_hours=WHALE_MAX_HOURS)
 
-            # STRATEGIE 1 : Arbitrage YES/NO garanti
+            # STRATEGIE 1 : Arbitrage YES/NO
             log.info("=== ARB YES/NO ===")
             opportunities = find_arb_opportunities(markets)
             if opportunities:
                 for opp in opportunities:
-                    if check_stop_loss():
+                    if check_stop_loss() or check_take_profit():
                         break
                     if open_val() + ARB_BET * 2 > MAX_OPEN_USDC:
                         break
@@ -533,13 +539,13 @@ def run():
                 log.info("Aucune opportunité ARB")
 
             # STRATEGIE 2 : Copy Whales
-            if open_val() < MAX_OPEN_USDC:
-                log.info("=== COPY WHALES (72h max) ===")
+            if open_val() < MAX_OPEN_USDC and not check_take_profit():
+                log.info("=== COPY WHALES (120h max) ===")
                 whales = detect_whales(markets)
                 if whales:
                     log.info(str(len(whales)) + " whale(s)!")
                     for w in whales:
-                        if check_stop_loss() or open_val() + 5.0 > MAX_OPEN_USDC:
+                        if check_stop_loss() or check_take_profit() or open_val() + 5.0 > MAX_OPEN_USDC:
                             break
                         log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
                         time.sleep(5)
@@ -557,10 +563,10 @@ def run():
                 else:
                     log.info("Aucune whale")
 
-            if check_stop_loss():
+            if check_stop_loss() or check_take_profit():
                 continue
 
-            # STRATEGIE 3 : BTC 5m avec heures actives
+            # STRATEGIE 3 : BTC 5m - 7h-19h UTC uniquement
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
                 hour_utc = datetime.now(timezone.utc).hour
@@ -610,7 +616,7 @@ def run():
                                         if price <= 0:
                                             price = 0.5
                                         log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                        if 0.50 <= price <= 0.80:
+                                        if 0.50 <= price <= 0.65:
                                             if place_order(token_id, target, price, bet_size, btc_current, slope):
                                                 traded_windows.add(window_ts)
                                         else:
