@@ -552,7 +552,7 @@ def run():
                         price = get_token_price(w["token_id"])
                         if price <= 0:
                             price = w["price"]
-                        if 0.45 <= price <= 0.75:
+                        if 0.45 <= price <= 0.70:
                             btc_now = get_btc_price()
                             if place_order(w["token_id"], w["outcome"], price, 5.0, btc_now):
                                 seen_trades.add(w["id"])
