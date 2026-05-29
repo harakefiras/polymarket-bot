@@ -15,6 +15,8 @@ MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BASE_BET = float(os.getenv("BASE_BET", "3"))
 MAX_BET = float(os.getenv("MAX_BET", "50"))
 
+ACTIVE_HOURS = list(range(7, 23))
+
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
@@ -386,7 +388,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v1 - Pente + Kelly + Monitor 30s")
+    log.info("Bot Smart v1 - Pente + Kelly + Heures actives")
     log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
     log.info("PnL chargé: " + str(round(daily_pnl, 2)))
 
@@ -418,7 +420,7 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # STRATEGIE 1 : Copy Whales - marchés < 48h
+            # STRATEGIE 1 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES (48h max) ===")
                 markets = get_active_markets(max_hours=WHALE_MAX_HOURS)
@@ -447,57 +449,61 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m - Pente pure
+            # STRATEGIE 2 : BTC 5m avec filtre heures actives
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
-                now               = int(time.time())
-                seconds_in_window = now % 300
-                window_ts         = now - seconds_in_window
-
-                if window_ts in traded_windows:
-                    log.info("Fenêtre déjà tradée")
+                hour_utc = datetime.now(timezone.utc).hour
+                if hour_utc not in ACTIVE_HOURS:
+                    log.info("Heure creuse (" + str(hour_utc) + "h UTC) - BTC suspendu")
                 else:
-                    if seconds_in_window > 90:
-                        seconds_to_next = 300 - seconds_in_window
-                        log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
-                        time.sleep(seconds_to_next)
-                        now               = int(time.time())
-                        window_ts         = now - (now % 300)
-                        seconds_in_window = 0
+                    now               = int(time.time())
+                    seconds_in_window = now % 300
+                    window_ts         = now - seconds_in_window
 
-                    if seconds_in_window < 30:
-                        log.info("Attente 30s stabilisation...")
-                        time.sleep(30)
+                    if window_ts in traded_windows:
+                        log.info("Fenêtre déjà tradée")
+                    else:
+                        if seconds_in_window > 90:
+                            seconds_to_next = 300 - seconds_in_window
+                            log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
+                            time.sleep(seconds_to_next)
+                            now               = int(time.time())
+                            window_ts         = now - (now % 300)
+                            seconds_in_window = 0
 
-                    slope       = get_btc_slope()
-                    btc_current = get_btc_price()
-                    market      = get_btc_market(window_ts)
+                        if seconds_in_window < 30:
+                            log.info("Attente 30s stabilisation...")
+                            time.sleep(30)
 
-                    if market:
-                        if slope > 25:
-                            target = "Up"
-                            log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -25:
-                            target = "Down"
-                            log.info("Signal DOWN " + str(round(slope)) + "$")
-                        else:
-                            target = None
-                            log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
+                        slope       = get_btc_slope()
+                        btc_current = get_btc_price()
+                        market      = get_btc_market(window_ts)
 
-                        if target:
-                            bet_size = calculate_bet_size_kelly(slope)
-                            for token in market.get("tokens", []):
-                                if token["outcome"] == target:
-                                    token_id = token["token_id"]
-                                    price    = get_token_price(token_id)
-                                    if price <= 0:
-                                        price = 0.5
-                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.50 <= price <= 0.80:
-                                        if place_order(token_id, target, price, bet_size, btc_current, slope):
-                                            traded_windows.add(window_ts)
-                                    else:
-                                        log.info("Prix hors fourchette: " + str(round(price, 2)))
+                        if market:
+                            if slope > 25:
+                                target = "Up"
+                                log.info("Signal UP +" + str(round(slope)) + "$")
+                            elif slope < -25:
+                                target = "Down"
+                                log.info("Signal DOWN " + str(round(slope)) + "$")
+                            else:
+                                target = None
+                                log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
+
+                            if target:
+                                bet_size = calculate_bet_size_kelly(slope)
+                                for token in market.get("tokens", []):
+                                    if token["outcome"] == target:
+                                        token_id = token["token_id"]
+                                        price    = get_token_price(token_id)
+                                        if price <= 0:
+                                            price = 0.5
+                                        log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
+                                        if 0.50 <= price <= 0.80:
+                                            if place_order(token_id, target, price, bet_size, btc_current, slope):
+                                                traded_windows.add(window_ts)
+                                        else:
+                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
 
         except Exception as e:
             log.error("Erreur: " + str(e))
