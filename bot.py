@@ -9,11 +9,13 @@ MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "50"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.20"))
-WHALE_MAX_HOURS = float(os.getenv("WHALE_MAX_HOURS", "48"))
+WHALE_MAX_HOURS = float(os.getenv("WHALE_MAX_HOURS", "72"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BASE_BET = float(os.getenv("BASE_BET", "3"))
 MAX_BET = float(os.getenv("MAX_BET", "50"))
+ARB_MAX_SUM = float(os.getenv("ARB_MAX_SUM", "0.94"))
+ARB_BET = float(os.getenv("ARB_BET", "10"))
 
 ACTIVE_HOURS = list(range(7, 23))
 
@@ -103,18 +105,19 @@ def get_btc_slope():
         if not r.ok:
             return 0
         candles = r.json()
-        closes  = [float(c[4]) for c in candles]
-        slope   = closes[-1] - closes[0]
+        closes = [float(c[4]) for c in candles]
+        slope = closes[-1] - closes[0]
         log.info("BTC courbe: " + str(round(closes[0])) + " -> " + str(round(closes[-1])) + " | Pente: " + str(round(slope)) + "$")
         return slope
     except Exception as e:
         log.error("Erreur courbe BTC: " + str(e))
         return 0
 
-daily_pnl      = load_daily_pnl()
-pnl_date       = date.today()
-seen_trades    = set()
+daily_pnl = load_daily_pnl()
+pnl_date = date.today()
+seen_trades = set()
 traded_windows = set()
+arb_traded = set()
 open_positions = []
 positions_lock = threading.Lock()
 
@@ -143,6 +146,18 @@ def open_val():
     with positions_lock:
         return sum(p["size"] for p in open_positions)
 
+def run_async(coro):
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+
 def get_hours_left(market):
     end_date = market.get("endDateIso") or market.get("endDate")
     if not end_date:
@@ -158,10 +173,10 @@ def get_hours_left(market):
 
 def get_active_markets(max_hours=168):
     try:
-        r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 50}, timeout=10)
+        r = requests.get(GAMMA_API + "/markets", params={"active": "true", "limit": 100}, timeout=10)
         if not r.ok:
             return []
-        markets  = r.json()
+        markets = r.json()
         filtered = [m for m in markets if 0 < get_hours_left(m) <= max_hours]
         log.info("Marchés valides: " + str(len(filtered)))
         return filtered
@@ -183,7 +198,7 @@ def detect_whales(markets):
     whales = []
     seen_market_tokens = set()
     for m in markets:
-        mid      = m.get("conditionId") or m.get("id")
+        mid = m.get("conditionId") or m.get("id")
         question = m.get("question", "?")
         if not mid or mid in traded_markets:
             continue
@@ -191,30 +206,81 @@ def detect_whales(markets):
         if not isinstance(trades, list):
             continue
         for t in trades:
-            tid      = t.get("transactionHash")
+            tid = t.get("transactionHash")
             if not tid or tid in seen_trades:
                 continue
-            size     = float(t.get("size",  0))
-            price    = float(t.get("price", 0.5))
+            size = float(t.get("size", 0))
+            price = float(t.get("price", 0.5))
             notional = size * price
             token_id = str(t.get("asset", ""))
-            outcome  = t.get("outcome", "Yes")
+            outcome = t.get("outcome", "Yes")
             market_key = mid + "_" + outcome
             if market_key in seen_market_tokens:
                 continue
             if notional >= MIN_WHALE_USDC and 0.45 <= price <= 0.65 and token_id:
                 whales.append({
-                    "id":         tid,
-                    "market_id":  mid,
-                    "market":     question,
-                    "token_id":   token_id,
-                    "price":      price,
-                    "notional":   notional,
-                    "outcome":    outcome,
+                    "id": tid,
+                    "market_id": mid,
+                    "market": question,
+                    "token_id": token_id,
+                    "price": price,
+                    "notional": notional,
+                    "outcome": outcome,
                     "market_key": market_key,
                 })
                 seen_market_tokens.add(market_key)
     return whales
+
+def get_midpoint_price(token_id):
+    """Récupère le prix mid du orderbook (plus fiable que last-trade-price pour ARB)."""
+    try:
+        r = requests.get(CLOB_API + "/midpoint", params={"token_id": token_id}, timeout=10)
+        if r.ok:
+            mid = float(r.json().get("mid", 0))
+            if mid > 0:
+                return mid
+        # Fallback sur last-trade-price si midpoint indispo
+        r2 = requests.get(CLOB_API + "/last-trade-price", params={"token_id": token_id}, timeout=10)
+        if r2.ok:
+            return float(r2.json().get("price", 1))
+        return 1
+    except:
+        return 1
+
+def find_arb_opportunities(markets):
+    opportunities = []
+    for m in markets:
+        mid = m.get("conditionId") or m.get("id")
+        if not mid or mid in arb_traded:
+            continue
+        try:
+            outcomes = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
+            token_ids = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+            if len(outcomes) != 2 or len(token_ids) != 2:
+                continue
+
+            # Utilise le midpoint (prix orderbook temps réel) au lieu du last-trade-price
+            prices = [get_midpoint_price(tid) for tid in token_ids]
+
+            if len(prices) == 2:
+                total = prices[0] + prices[1]
+                profit = 1 - total
+                if total <= ARB_MAX_SUM and profit > 0:
+                    log.info("ARB TROUVE! " + m.get("question", "?")[:40] + " | " + str(round(prices[0], 3)) + " + " + str(round(prices[1], 3)) + " = " + str(round(total, 3)) + " | Profit: " + str(round(profit * 100, 1)) + "%")
+                    opportunities.append({
+                        "market_id": mid,
+                        "question": m.get("question", "?"),
+                        "token_yes": token_ids[0],
+                        "token_no": token_ids[1],
+                        "price_yes": prices[0],
+                        "price_no": prices[1],
+                        "total": total,
+                        "profit_pct": profit
+                    })
+        except Exception as e:
+            log.error("Erreur ARB scan: " + str(e))
+            continue
+    return opportunities
 
 def get_btc_price():
     try:
@@ -228,14 +294,14 @@ def get_btc_price():
 def get_btc_market(window_ts):
     try:
         slug = "btc-updown-5m-" + str(window_ts)
-        r    = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
+        r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
         if r.ok:
-            data   = r.json()
+            data = r.json()
             market = data[0] if isinstance(data, list) and len(data) > 0 else None
             if market:
-                outcomes  = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+                outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
                 token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
-                tokens    = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+                tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
                 market["tokens"] = tokens
                 return market
         return None
@@ -271,7 +337,7 @@ async def sell_order_async(token_id, shares, reason, price):
         return False
 
 def sell_order(token_id, shares, reason, price):
-    return asyncio.run(sell_order_async(token_id, shares, reason, price))
+    return run_async(sell_order_async(token_id, shares, reason, price))
 
 async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope):
     try:
@@ -286,15 +352,15 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope
                 log.info("TRADE " + outcome + " " + str(bet_size) + " USDC @ " + str(round(price, 2)) + " | BTC: " + str(round(btc_entry)))
                 with positions_lock:
                     open_positions.append({
-                        "token_id":    token_id,
+                        "token_id": token_id,
                         "entry_price": price,
-                        "shares":      shares,
-                        "size":        bet_size,
-                        "outcome":     outcome,
-                        "btc_entry":   btc_entry,
-                        "side":        outcome,
-                        "slope":       slope,
-                        "hour":        datetime.now().hour,
+                        "shares": shares,
+                        "size": bet_size,
+                        "outcome": outcome,
+                        "btc_entry": btc_entry,
+                        "side": outcome,
+                        "slope": slope,
+                        "hour": datetime.now().hour,
                     })
                 return True
             else:
@@ -305,7 +371,33 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope
         return False
 
 def place_order(token_id, outcome, price, bet_size, btc_entry, slope=0):
-    return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry, slope))
+    return run_async(place_order_async(token_id, outcome, price, bet_size, btc_entry, slope))
+
+async def place_arb_async(opp):
+    try:
+        from polymarket import AsyncSecureClient
+        async with await AsyncSecureClient.create(private_key=PRIVATE_KEY, wallet=WALLET) as client:
+            shares_yes = round(ARB_BET / opp["price_yes"], 2)
+            shares_no = round(ARB_BET / opp["price_no"], 2)
+            r1 = await client.place_limit_order(
+                token_id=opp["token_yes"], side="BUY",
+                price=str(round(opp["price_yes"], 4)), size=str(shares_yes)
+            )
+            r2 = await client.place_limit_order(
+                token_id=opp["token_no"], side="BUY",
+                price=str(round(opp["price_no"], 4)), size=str(shares_no)
+            )
+            if r1.ok and r2.ok:
+                profit = round(opp["profit_pct"] * ARB_BET * 2, 3)
+                log.info("ARB EXECUTE! " + opp["question"][:40] + " | Profit: +" + str(profit) + " USDC")
+                return True
+        return False
+    except Exception as e:
+        log.error("Exception ARB: " + str(e))
+        return False
+
+def place_arb(opp):
+    return run_async(place_arb_async(opp))
 
 def monitor_loop():
     global daily_pnl, open_positions
@@ -318,16 +410,16 @@ def monitor_loop():
                 time.sleep(MONITOR_INTERVAL)
                 continue
             btc_current = get_btc_price()
-            to_remove   = []
+            to_remove = []
             for pos in positions_copy:
-                token_id  = pos["token_id"]
-                current   = get_token_price(token_id)
+                token_id = pos["token_id"]
+                current = get_token_price(token_id)
                 if current <= 0:
                     continue
-                entry     = pos["entry_price"]
-                shares    = pos["shares"]
+                entry = pos["entry_price"]
+                shares = pos["shares"]
                 btc_entry = pos.get("btc_entry", 0)
-                side      = pos.get("side", "Up")
+                side = pos.get("side", "Up")
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
                 if current >= 0.98:
@@ -388,8 +480,9 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v1 - Pente + Kelly + Heures actives")
-    log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("Bot Smart v5 - Pente + Kelly + Whales 72h + ARB YES/NO midpoint + fix asyncio")
+    log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("ARB: mise " + str(ARB_BET) + " USDC | seuil " + str(ARB_MAX_SUM))
     log.info("PnL chargé: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -408,9 +501,10 @@ def run():
             if today != pnl_date:
                 log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
                 daily_pnl = 0.0
-                pnl_date  = today
+                pnl_date = today
                 seen_trades.clear()
                 traded_windows.clear()
+                arb_traded.clear()
                 save_daily_pnl(0.0)
 
             if check_stop_loss():
@@ -420,11 +514,28 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # STRATEGIE 1 : Copy Whales
+            markets = get_active_markets(max_hours=WHALE_MAX_HOURS)
+
+            # STRATEGIE 1 : Arbitrage YES/NO garanti
+            log.info("=== ARB YES/NO ===")
+            opportunities = find_arb_opportunities(markets)
+            if opportunities:
+                for opp in opportunities:
+                    if check_stop_loss():
+                        break
+                    if open_val() + ARB_BET * 2 > MAX_OPEN_USDC:
+                        break
+                    if place_arb(opp):
+                        arb_traded.add(opp["market_id"])
+                        daily_pnl += opp["profit_pct"] * ARB_BET * 2
+                        save_daily_pnl(daily_pnl)
+            else:
+                log.info("Aucune opportunité ARB")
+
+            # STRATEGIE 2 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
-                log.info("=== COPY WHALES (48h max) ===")
-                markets = get_active_markets(max_hours=WHALE_MAX_HOURS)
-                whales  = detect_whales(markets)
+                log.info("=== COPY WHALES (72h max) ===")
+                whales = detect_whales(markets)
                 if whales:
                     log.info(str(len(whales)) + " whale(s)!")
                     for w in whales:
@@ -449,16 +560,16 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m avec filtre heures actives
+            # STRATEGIE 3 : BTC 5m avec heures actives
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
                 hour_utc = datetime.now(timezone.utc).hour
                 if hour_utc not in ACTIVE_HOURS:
                     log.info("Heure creuse (" + str(hour_utc) + "h UTC) - BTC suspendu")
                 else:
-                    now               = int(time.time())
+                    now = int(time.time())
                     seconds_in_window = now % 300
-                    window_ts         = now - seconds_in_window
+                    window_ts = now - seconds_in_window
 
                     if window_ts in traded_windows:
                         log.info("Fenêtre déjà tradée")
@@ -467,17 +578,17 @@ def run():
                             seconds_to_next = 300 - seconds_in_window
                             log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
                             time.sleep(seconds_to_next)
-                            now               = int(time.time())
-                            window_ts         = now - (now % 300)
+                            now = int(time.time())
+                            window_ts = now - (now % 300)
                             seconds_in_window = 0
 
                         if seconds_in_window < 30:
                             log.info("Attente 30s stabilisation...")
                             time.sleep(30)
 
-                        slope       = get_btc_slope()
+                        slope = get_btc_slope()
                         btc_current = get_btc_price()
-                        market      = get_btc_market(window_ts)
+                        market = get_btc_market(window_ts)
 
                         if market:
                             if slope > 25:
@@ -495,7 +606,7 @@ def run():
                                 for token in market.get("tokens", []):
                                     if token["outcome"] == target:
                                         token_id = token["token_id"]
-                                        price    = get_token_price(token_id)
+                                        price = get_token_price(token_id)
                                         if price <= 0:
                                             price = 0.5
                                         log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
