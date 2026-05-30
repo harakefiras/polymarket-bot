@@ -12,8 +12,10 @@ STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.25"))
 MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
-BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "3"))
-BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "10"))
+BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "5"))
+BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "12"))
+
+ACTIVE_HOURS = list(range(7, 14))  # 7h a 13h59 (heure Abidjan = UTC)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -80,11 +82,11 @@ def open_val():
 def calculate_bet_size(slope):
     abs_slope = abs(slope)
     if abs_slope >= 150:
-        bet = BET_SIZE_MAX
+        bet = 12.0
     elif abs_slope >= 50:
-        bet = 6.0
+        bet = 8.0
     else:
-        bet = BET_SIZE_MIN
+        bet = 5.0
     log.info("Pente: " + str(round(slope)) + "$ | Mise: " + str(bet) + " USDC")
     return bet
 
@@ -319,7 +321,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Stable - Paliers 3/6/10 - sans Kelly")
+    log.info("Bot Stable - Paliers 5/8/12 - 7h-14h (Abidjan)")
     log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -346,6 +348,12 @@ def run():
             if check_stop_loss():
                 log.warning("Stop-loss atteint! Pause 1h.")
                 time.sleep(3600)
+                continue
+
+            hour_utc = datetime.now(timezone.utc).hour
+            if hour_utc not in ACTIVE_HOURS:
+                log.info("Hors plage 7h-14h (" + str(hour_utc) + "h) - pause")
+                time.sleep(300)
                 continue
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
