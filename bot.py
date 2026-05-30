@@ -71,7 +71,6 @@ def analyze_patterns():
     if len(history) < 10:
         return None
     winning_trades = [t for t in history if t.get("result") == "win"]
-    losing_trades = [t for t in history if t.get("result") == "loss"]
     if not winning_trades:
         return None
     win_rate = len(winning_trades) / len(history)
@@ -80,7 +79,7 @@ def analyze_patterns():
     win_hours = [t.get("hour", 12) for t in winning_trades]
     avg_win_slope = sum(win_slopes) / len(win_slopes) if win_slopes else 50
     avg_win_price = sum(win_prices) / len(win_prices) if win_prices else 0.55
-    log.info("Analyse patterns: " + str(len(history)) + " trades | Win rate: " + str(round(win_rate * 100, 1)) + "% | Slope moy gagnante: " + str(round(avg_win_slope)) + "$ | Prix moy gagnant: " + str(round(avg_win_price, 2)))
+    log.info("Patterns: " + str(len(history)) + " trades | Win rate: " + str(round(win_rate * 100, 1)) + "%")
     return {
         "win_rate": win_rate,
         "avg_win_slope": avg_win_slope,
@@ -302,7 +301,6 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry, slope
                         "token_id": token_id, "entry_price": price, "shares": shares,
                         "size": bet_size, "outcome": outcome, "btc_entry": btc_entry,
                         "side": outcome, "slope": slope, "hour": datetime.now().hour,
-                        "entry_time": time.time(),
                     })
                 return True
             log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -336,7 +334,6 @@ def monitor_loop():
                 btc_entry = pos.get("btc_entry", 0)
                 side = pos.get("side", "Up")
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
-
                 if current <= 0.02:
                     log.info("Marche expire - PERTE")
                     save_trade({"result": "loss", "slope": pos.get("slope", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round((current - entry) * shares, 2)})
@@ -348,6 +345,7 @@ def monitor_loop():
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
                     save_trade({"result": "win", "slope": pos.get("slope", 0), "entry_price": entry, "hour": pos.get("hour", 0), "pnl": round(pnl, 2)})
+                    log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
                 elif current <= STOP_LOSS_PRICE:
@@ -384,8 +382,9 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Smart v1 - Apprentissage automatique demarre!")
-    log.info("Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL charge: " + str(round(daily_pnl, 2)))
+    log.info("Bot Smart v1 - Pente + Kelly + Monitor 30s")
+    log.info("Mise: " + str(BASE_BET) + "-" + str(MAX_BET) + " USDC | Stop-loss: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("PnL charge: " + str(round(daily_pnl, 2)))
     patterns = analyze_patterns()
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -411,7 +410,7 @@ def run():
                 patterns = analyze_patterns()
 
             if check_stop_loss():
-                log.warning("Stop-loss atteint (" + str(round(daily_pnl, 2)) + " USDC). Pause 1h.")
+                log.warning("Stop-loss atteint! Pause 1h.")
                 time.sleep(3600)
                 continue
 
@@ -446,7 +445,7 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m INTELLIGENT
+            # STRATEGIE 2 : BTC 5m
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M SMART ===")
                 now = int(time.time())
@@ -469,10 +468,10 @@ def run():
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
                     if market:
-                        if slope > 50:
+                        if slope > 25:
                             target = "Up"
                             log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -50:
+                        elif slope < -25:
                             target = "Down"
                             log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
@@ -487,14 +486,16 @@ def run():
                                     price = get_token_price(token_id)
                                     if price <= 0:
                                         price = 0.5
-                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise SMART: " + str(bet_size) + " USDC")
+                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
                                     if 0.50 <= price <= 0.70:
                                         if place_order(token_id, target, price, bet_size, btc_current, slope):
                                             traded_windows.add(window_ts)
                                     else:
                                         log.info("Prix hors fourchette: " + str(round(price, 2)))
+
         except Exception as e:
             log.error("Erreur: " + str(e))
+
         wait = POLL_INTERVAL + random.uniform(0, 10)
         log.info("Prochain scan dans " + str(int(wait/60)) + " min")
         time.sleep(wait)
