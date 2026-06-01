@@ -119,16 +119,17 @@ def get_order_status(order_id):
     except:
         return None
 
-def get_bnb_balance():
+def get_asset_balance():
     try:
         params = {"timestamp": int(ts() * 1000)}
         params = sign(params)
         r = requests.get(BINANCE_API + "/api/v3/account",
             params=params, headers=headers(), timeout=10)
         if r.ok:
-            for asset in r.json().get("balances", []):
-                if asset["asset"] == SYMBOL.replace("USDT", ""):
-                    return float(asset["free"])
+            asset = SYMBOL.replace("USDT", "")
+            for b in r.json().get("balances", []):
+                if b["asset"] == asset:
+                    return float(b["free"])
         return 0
     except:
         return 0
@@ -140,20 +141,21 @@ def run():
         log.error("Cles API manquantes!")
         return
 
-    symbol_info = None
-while not symbol_info:
-    symbol_info = get_symbol_info()
-    if not symbol_info:
-        log.error("Impossible de recuperer les infos du symbole - retry dans 60s")
-        time.sleep(60)
-
+    # Recupere les infos du symbole avec retry
     step_size = 0.01
     tick_size = 0.1
-    for f in symbol_info.get("filters", []):
-        if f["filterType"] == "LOT_SIZE":
-            step_size = float(f["stepSize"])
-        if f["filterType"] == "PRICE_FILTER":
-            tick_size = float(f["tickSize"])
+    while True:
+        symbol_info = get_symbol_info()
+        if symbol_info:
+            for f in symbol_info.get("filters", []):
+                if f["filterType"] == "LOT_SIZE":
+                    step_size = float(f["stepSize"])
+                if f["filterType"] == "PRICE_FILTER":
+                    tick_size = float(f["tickSize"])
+            log.info("Symbole OK | step: " + str(step_size) + " | tick: " + str(tick_size))
+            break
+        log.error("Infos symbole indisponibles - retry dans 60s")
+        time.sleep(60)
 
     buy_order_id = None
     sell_order_id = None
@@ -168,11 +170,10 @@ while not symbol_info:
         try:
             current_price = get_current_price()
             if current_price <= 0:
-                log.error("Prix introuvable")
-                time.sleep(CHECK_INTERVAL)
+                log.error("Prix introuvable - retry dans 60s")
+                time.sleep(60)
                 continue
 
-            # ETAT : EN ATTENTE D'ACHAT
             if state == "IDLE":
                 avg = get_average_price(AVERAGE_DAYS)
                 if avg <= 0:
@@ -188,10 +189,11 @@ while not symbol_info:
                 if buy_order_id is None:
                     log.info("Placement ordre ACHAT @ " + str(buy_target) + "$")
                     buy_order_id = place_limit_order("BUY", buy_target, quantity)
-                    buy_time = time.time()
-                    fixed_buy_price = buy_target
-                    fixed_sell_price = sell_target
-                    fixed_quantity = quantity
+                    if buy_order_id:
+                        buy_time = time.time()
+                        fixed_buy_price = buy_target
+                        fixed_sell_price = sell_target
+                        fixed_quantity = quantity
                 else:
                     status = get_order_status(buy_order_id)
                     log.info("Statut achat: " + str(status))
@@ -209,16 +211,16 @@ while not symbol_info:
                         buy_order_id = None
                         buy_time = None
 
-            # ETAT : BNB ACHETE - SEUILS FIXES AU MOMENT DE L'ACHAT
             elif state == "HOLDING":
-                log.info("Prix: " + str(round(current_price, 2)) + "$ | Vente cible fixee: " + str(fixed_sell_price) + "$")
+                log.info("Prix: " + str(round(current_price, 2)) + "$ | Vente cible: " + str(fixed_sell_price) + "$")
 
                 if sell_order_id is None:
-                    balance = get_bnb_balance()
+                    balance = get_asset_balance()
                     sell_qty = round_quantity(min(fixed_quantity, balance), step_size)
                     log.info("Placement ordre VENTE @ " + str(fixed_sell_price) + "$")
                     sell_order_id = place_limit_order("SELL", fixed_sell_price, sell_qty)
-                    sell_time = time.time()
+                    if sell_order_id:
+                        sell_time = time.time()
                 else:
                     status = get_order_status(sell_order_id)
                     log.info("Statut vente: " + str(status))
