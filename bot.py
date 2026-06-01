@@ -336,7 +336,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Stable - Paliers 5/8/12 - TP 0.85 - SL 0.30 - 7h-14h")
+    log.info("Bot Stable - Paliers 5/8/12 - Entree 0.50-0.55 - TP 0.85 - SL 0.30 - 7h-14h")
     log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -443,7 +443,7 @@ def run():
                                     if price <= 0:
                                         price = 0.5
                                     log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.50 <= price <= 0.70:
+                                    if 0.50 <= price <= 0.55:
                                         if place_order(token_id, target, price, bet_size, btc_current):
                                             traded_windows.add(window_ts)
                                     else:
