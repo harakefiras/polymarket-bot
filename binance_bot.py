@@ -70,6 +70,18 @@ def round_price(price, tick_size):
     precision = len(str(tick_size).rstrip("0").split(".")[-1]) if "." in str(tick_size) else 0
     return round(price, precision)
 
+def get_open_orders():
+    try:
+        params = {"symbol": SYMBOL, "timestamp": int(ts() * 1000)}
+        params = sign(params)
+        r = requests.get(BINANCE_API + "/api/v3/openOrders",
+            params=params, headers=headers(), timeout=10)
+        if r.ok:
+            return r.json()
+        return []
+    except:
+        return []
+
 def place_limit_order(side, price, quantity):
     try:
         params = {
@@ -135,13 +147,12 @@ def get_asset_balance():
         return 0
 
 def run():
-    log.info("Bot Binance Grid - " + SYMBOL + " | Moyenne " + str(AVERAGE_DAYS) + "j | ±" + str(DEVIATION_PCT) + "% | Mise: " + str(TRADE_AMOUNT_USDT) + "$")
+    log.info("Bot Binance Grid - " + SYMBOL + " | Moyenne " + str(AVERAGE_DAYS) + "j | +-" + str(DEVIATION_PCT) + "% | Mise: " + str(TRADE_AMOUNT_USDT) + "$")
 
     if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
         log.error("Cles API manquantes!")
         return
 
-    # Recupere les infos du symbole avec retry
     step_size = 0.01
     tick_size = 0.1
     while True:
@@ -165,6 +176,41 @@ def run():
     fixed_sell_price = None
     fixed_quantity = None
     state = "IDLE"
+
+    log.info("Verification des ordres existants sur Binance...")
+    open_orders = get_open_orders()
+    if open_orders:
+        log.info(str(len(open_orders)) + " ordre(s) existant(s) trouve(s)")
+        for o in open_orders:
+            order_id = o.get("orderId")
+            side = o.get("side")
+            price = float(o.get("price", 0))
+            qty = float(o.get("origQty", 0))
+            order_time = o.get("time", 0)
+            real_time = order_time / 1000 if order_time else time.time()
+            heures_ecoule = round((time.time() - real_time) / 3600, 1)
+
+            log.info("Reprise ordre: " + side + " @ " + str(price) + "$ | ID: " + str(order_id) + " | Age: " + str(heures_ecoule) + "h")
+
+            if side == "BUY":
+                buy_order_id = order_id
+                fixed_buy_price = price
+                fixed_quantity = qty
+                buy_time = real_time
+                avg = get_average_price(AVERAGE_DAYS)
+                fixed_sell_price = round_price(avg * (1 + DEVIATION_PCT / 100), tick_size)
+                state = "IDLE"
+                log.info("Ordre ACHAT repris | Vente cible: " + str(fixed_sell_price) + "$ | Timeout dans " + str(round(ORDER_TIMEOUT_HOURS - heures_ecoule, 1)) + "h")
+
+            elif side == "SELL":
+                sell_order_id = order_id
+                fixed_sell_price = price
+                fixed_quantity = qty
+                sell_time = real_time
+                state = "HOLDING"
+                log.info("Ordre VENTE repris @ " + str(price) + "$ | Timeout dans " + str(round(ORDER_TIMEOUT_HOURS - heures_ecoule, 1)) + "h")
+    else:
+        log.info("Aucun ordre existant - demarrage propre")
 
     while True:
         try:
@@ -196,7 +242,9 @@ def run():
                         fixed_quantity = quantity
                 else:
                     status = get_order_status(buy_order_id)
-                    log.info("Statut achat: " + str(status))
+                    heures = round((time.time() - buy_time) / 3600, 1) if buy_time else 0
+                    log.info("Statut achat: " + str(status) + " @ " + str(fixed_buy_price) + "$ | Age: " + str(heures) + "h/" + str(ORDER_TIMEOUT_HOURS) + "h")
+
                     if status == "FILLED":
                         log.info("ACHAT EXECUTE @ " + str(fixed_buy_price) + "$ | Attente vente @ " + str(fixed_sell_price) + "$")
                         buy_order_id = None
@@ -223,7 +271,9 @@ def run():
                         sell_time = time.time()
                 else:
                     status = get_order_status(sell_order_id)
-                    log.info("Statut vente: " + str(status))
+                    heures = round((time.time() - sell_time) / 3600, 1) if sell_time else 0
+                    log.info("Statut vente: " + str(status) + " @ " + str(fixed_sell_price) + "$ | Age: " + str(heures) + "h/" + str(ORDER_TIMEOUT_HOURS) + "h")
+
                     if status == "FILLED":
                         profit = round((fixed_sell_price - fixed_buy_price) * fixed_quantity, 2)
                         log.info("VENTE EXECUTE @ " + str(fixed_sell_price) + "$ | Profit estime: +" + str(profit) + "$")
