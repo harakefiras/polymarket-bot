@@ -8,14 +8,15 @@ STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "30"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "30"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
 MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
-STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.25"))
+STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.30"))
+TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.85"))
 MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "5"))
 BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "12"))
 
-ACTIVE_HOURS = list(range(7, 14))  # 7h a 13h59 (heure Abidjan = UTC)
+ACTIVE_HOURS = list(range(7, 14))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -278,10 +279,12 @@ def monitor_loop():
                 btc_entry = pos.get("btc_entry", 0)
                 side = pos.get("side", "Up")
                 log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
+
                 if current <= 0.02:
                     log.info("Marche expire - PERTE")
                     to_remove.append(pos)
                     continue
+
                 elif current >= 0.98:
                     log.info("Marche expire - GAIN!")
                     pnl = (current - entry) * shares
@@ -290,6 +293,16 @@ def monitor_loop():
                     log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
+
+                elif current >= TAKE_PROFIT_PRICE:
+                    log.info("TAKE PROFIT! @ " + str(round(current, 2)))
+                    if sell_order(token_id, shares, "TP", current):
+                        pnl = (current - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        log.info("PnL TP: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
+                        to_remove.append(pos)
+
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
@@ -297,6 +310,7 @@ def monitor_loop():
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
                         to_remove.append(pos)
+
                 elif btc_entry > 0 and btc_current > 0:
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
@@ -310,6 +324,7 @@ def monitor_loop():
                             daily_pnl += (current - entry) * shares
                             save_daily_pnl(daily_pnl)
                             to_remove.append(pos)
+
             if to_remove:
                 with positions_lock:
                     for pos in to_remove:
@@ -321,7 +336,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Stable - Paliers 5/8/12 - 7h-14h (Abidjan)")
+    log.info("Bot Stable - Paliers 5/8/12 - TP 0.85 - SL 0.30 - 7h-14h")
     log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -387,7 +402,7 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m - paliers pente
+            # STRATEGIE 2 : BTC 5m
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
                 now = int(time.time())
