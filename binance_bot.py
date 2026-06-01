@@ -140,10 +140,12 @@ def run():
         log.error("Cles API manquantes!")
         return
 
+    symbol_info = None
+while not symbol_info:
     symbol_info = get_symbol_info()
     if not symbol_info:
-        log.error("Impossible de recuperer les infos du symbole!")
-        return
+        log.error("Impossible de recuperer les infos du symbole - retry dans 60s")
+        time.sleep(60)
 
     step_size = 0.01
     tick_size = 0.1
