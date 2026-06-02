@@ -16,7 +16,7 @@ MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "5"))
 BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "12"))
 
-ACTIVE_HOURS = list(range(7, 14))
+ACTIVE_HOURS = list(range(7, 15))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
