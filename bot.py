@@ -21,7 +21,8 @@ ACTIVE_HOURS = list(range(7, 14))
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
-BINANCE_API = "https://api.binance.com"
+COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
+COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 TRADED_FILE = "/app/traded_markets.txt"
 PNL_FILE = "/app/daily_pnl.txt"
 
@@ -167,25 +168,29 @@ def detect_whales(markets):
 
 def get_btc_price():
     try:
-        r = requests.get(BINANCE_API + "/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=10)
+        r = requests.get(COINBASE_SPOT, timeout=10)
         if r.ok:
-            return float(r.json().get("price", 0))
+            return float(r.json()["data"]["amount"])
         return 0
     except:
         return 0
 
 def get_btc_slope():
     try:
-        r = requests.get(BINANCE_API + "/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 5}, timeout=10)
+        r = requests.get(COINBASE_CANDLES, params={"granularity": 60}, timeout=10)
         if not r.ok:
             return 0
         candles = r.json()
-        closes = [float(c[4]) for c in candles]
-        slope = closes[-1] - closes[0]
-        log.info("BTC courbe: " + str(round(closes[0])) + " -> " + str(round(closes[-1])) + " | Pente: " + str(round(slope)) + "$")
+        if not isinstance(candles, list) or len(candles) < 5:
+            return 0
+        # Coinbase renvoie le plus récent en premier : [time, low, high, open, close, volume]
+        newest = float(candles[0][4])
+        older = float(candles[4][4])
+        slope = newest - older
+        log.info("BTC courbe: " + str(round(older)) + " -> " + str(round(newest)) + " | Pente: " + str(round(slope)) + "$")
         return slope
-    except:
+    except Exception as e:
+        log.error("Erreur courbe BTC: " + str(e))
         return 0
 
 def get_btc_market(window_ts):
@@ -284,7 +289,6 @@ def monitor_loop():
                     log.info("Marche expire - PERTE")
                     to_remove.append(pos)
                     continue
-
                 elif current >= 0.98:
                     log.info("Marche expire - GAIN!")
                     pnl = (current - entry) * shares
@@ -293,7 +297,6 @@ def monitor_loop():
                     log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
-
                 elif current >= TAKE_PROFIT_PRICE:
                     log.info("TAKE PROFIT! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "TP", current):
@@ -302,7 +305,6 @@ def monitor_loop():
                         save_daily_pnl(daily_pnl)
                         log.info("PnL TP: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
-
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
@@ -310,7 +312,6 @@ def monitor_loop():
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
                         to_remove.append(pos)
-
                 elif btc_entry > 0 and btc_current > 0:
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
@@ -336,7 +337,7 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Stable - Paliers 5/8/12 - Entree 0.50-0.55 - TP 0.85 - SL 0.30 - 7h-14h")
+    log.info("Bot Stable - Paliers 5/8/12 - BTC via Coinbase - TP 0.85 - SL 0.30 - 7h-14h")
     log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -373,7 +374,6 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
 
-            # STRATEGIE 1 : Copy Whales
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
                 markets = get_active_markets()
@@ -402,7 +402,6 @@ def run():
             if check_stop_loss():
                 continue
 
-            # STRATEGIE 2 : BTC 5m
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== BTC 5M ===")
                 now = int(time.time())
