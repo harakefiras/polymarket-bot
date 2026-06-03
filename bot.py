@@ -368,7 +368,7 @@ def run():
 
             hour_utc = datetime.now(timezone.utc).hour
             if hour_utc not in ACTIVE_HOURS:
-                log.info("Hors plage 7h-14h (" + str(hour_utc) + "h) - pause")
+                log.info("Hors plage 7h-22h (" + str(hour_utc) + "h) - pause")
                 time.sleep(300)
                 continue
 
@@ -440,9 +440,9 @@ def run():
                                     token_id = token["token_id"]
                                     price = get_token_price(token_id)
                                     if price <= 0:
-                                        price = 0.45
+                                        price = 0.5
                                     log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.48 <= price <= 0.60:
+                                    if 0.5 <= price <= 0.60:
                                         if place_order(token_id, target, price, bet_size, btc_current):
                                             traded_windows.add(window_ts)
                                     else:
