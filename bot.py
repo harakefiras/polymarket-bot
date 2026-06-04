@@ -5,16 +5,19 @@ import threading
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 STOP_LOSS_USDC = float(os.getenv("STOP_LOSS_USDC", "30"))
+DAILY_TAKE_PROFIT = float(os.getenv("DAILY_TAKE_PROFIT", "60"))
 MAX_OPEN_USDC = float(os.getenv("MAX_OPEN_USDC", "30"))
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "300"))
-MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "200"))
+MIN_WHALE_USDC = float(os.getenv("MIN_WHALE_USDC", "100"))
 STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.30"))
 TAKE_PROFIT_PRICE = float(os.getenv("TAKE_PROFIT_PRICE", "0.85"))
 MAX_MARKET_HOURS = float(os.getenv("MAX_MARKET_HOURS", "168"))
 BTC_DEVIATION = float(os.getenv("BTC_DEVIATION", "150"))
 MONITOR_INTERVAL = float(os.getenv("MONITOR_INTERVAL", "30"))
 BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "5"))
-BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "12"))
+BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "20"))
+MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
+CIRCUIT_BREAKER_PAUSE = int(os.getenv("CIRCUIT_BREAKER_PAUSE", "7200"))  # 2h en secondes
 
 ACTIVE_HOURS = list(range(7, 21))
 
@@ -25,8 +28,6 @@ COINBASE_SPOT = "https://api.coinbase.com/v2/prices/BTC-USD/spot"
 COINBASE_CANDLES = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
 TRADED_FILE = "/app/traded_markets.txt"
 PNL_FILE = "/app/daily_pnl.txt"
-
-BLOCKED_KEYWORDS = ["nba", "nhl", "nfl", "mlb", "stanley", "finals", "championship", "season", "playoffs", "super bowl", "world series", "soccer", "football", "basketball", "hockey", "baseball"]
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger("bot")
@@ -55,6 +56,8 @@ seen_trades = set()
 traded_windows = set()
 open_positions = []
 positions_lock = threading.Lock()
+consecutive_losses = 0
+circuit_breaker_until = 0
 
 def load_traded_markets():
     try:
@@ -77,27 +80,30 @@ traded_markets = load_traded_markets()
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
 
+def check_take_profit():
+    return daily_pnl >= DAILY_TAKE_PROFIT
+
+def check_circuit_breaker():
+    return time.time() < circuit_breaker_until
+
 def open_val():
     with positions_lock:
         return sum(p["size"] for p in open_positions)
 
 def calculate_bet_size(slope):
     abs_slope = abs(slope)
-    if abs_slope >= 150:
-        bet = 12.0
+    if abs_slope >= 200:
+        bet = 20.0
+    elif abs_slope >= 100:
+        bet = 10.0
     elif abs_slope >= 50:
-        bet = 8.0
-    else:
         bet = 5.0
+    else:
+        bet = 0.0
     log.info("Pente: " + str(round(slope)) + "$ | Mise: " + str(bet) + " USDC")
     return bet
 
 def is_market_valid(market):
-    question = (market.get("question") or "").lower()
-    slug = (market.get("slug") or "").lower()
-    for kw in BLOCKED_KEYWORDS:
-        if kw in question or kw in slug:
-            return False
     end_date = market.get("endDateIso") or market.get("endDate")
     if not end_date:
         return False
@@ -157,7 +163,7 @@ def detect_whales(markets):
             market_key = mid + "_" + outcome
             if market_key in seen_market_tokens:
                 continue
-            if notional >= MIN_WHALE_USDC and 0.45 <= price <= 0.65 and token_id:
+            if notional >= MIN_WHALE_USDC and 0.35 <= price <= 0.75 and token_id:
                 whales.append({
                     "id": tid, "market_id": mid, "market": question,
                     "token_id": token_id, "price": price, "notional": notional,
@@ -183,7 +189,6 @@ def get_btc_slope():
         candles = r.json()
         if not isinstance(candles, list) or len(candles) < 5:
             return 0
-        # Coinbase renvoie le plus récent en premier : [time, low, high, open, close, volume]
         newest = float(candles[0][4])
         older = float(candles[4][4])
         slope = newest - older
@@ -263,7 +268,7 @@ def place_order(token_id, outcome, price, bet_size, btc_entry):
     return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry))
 
 def monitor_loop():
-    global daily_pnl, open_positions
+    global daily_pnl, open_positions, consecutive_losses, circuit_breaker_until
     log.info("Thread surveillance demarre - toutes les " + str(int(MONITOR_INTERVAL)) + "s")
     while True:
         try:
@@ -287,43 +292,78 @@ def monitor_loop():
 
                 if current <= 0.02:
                     log.info("Marche expire - PERTE")
+                    pnl = (current - entry) * shares
+                    daily_pnl += pnl
+                    save_daily_pnl(daily_pnl)
+                    consecutive_losses += 1
+                    log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
+                    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                        circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+                        log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes consecutives - pause 2h")
+                        consecutive_losses = 0
                     to_remove.append(pos)
                     continue
+
                 elif current >= 0.98:
                     log.info("Marche expire - GAIN!")
                     pnl = (current - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
+                    consecutive_losses = 0
                     log.info("PnL: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
                     continue
+
                 elif current >= TAKE_PROFIT_PRICE:
                     log.info("TAKE PROFIT! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "TP", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
+                        consecutive_losses = 0
                         log.info("PnL TP: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
+
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 2)))
                     if sell_order(token_id, shares, "SL", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
+                        consecutive_losses += 1
+                        log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
+                        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                            circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+                            log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes consecutives - pause 2h")
+                            consecutive_losses = 0
                         to_remove.append(pos)
+
                 elif btc_entry > 0 and btc_current > 0:
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
                         if sell_order(token_id, shares, "SL_BTC", current):
-                            daily_pnl += (current - entry) * shares
+                            pnl = (current - entry) * shares
+                            daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
+                            consecutive_losses += 1
+                            log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
+                            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                                circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+                                log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes consecutives - pause 2h")
+                                consecutive_losses = 0
                             to_remove.append(pos)
                     elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
                         log.info("STOP BTC UP!")
                         if sell_order(token_id, shares, "SL_BTC", current):
-                            daily_pnl += (current - entry) * shares
+                            pnl = (current - entry) * shares
+                            daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
+                            consecutive_losses += 1
+                            log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
+                            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+                                circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+                                log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes consecutives - pause 2h")
+                                consecutive_losses = 0
                             to_remove.append(pos)
 
             if to_remove:
@@ -336,9 +376,10 @@ def monitor_loop():
         time.sleep(MONITOR_INTERVAL)
 
 def run():
-    global daily_pnl, pnl_date, traded_markets
-    log.info("Bot Stable - Paliers 5/8/12 - BTC via Coinbase - TP 0.85 - SL 0.30 - 7h-14h")
-    log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | Plafond: " + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
+    global daily_pnl, pnl_date, traded_markets, consecutive_losses
+    log.info("Bot Smart v3 - Paliers 5/10/20 - TP 60$ - SL 30$ - Circuit breaker 4 pertes")
+    log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | TP jour: " + str(DAILY_TAKE_PROFIT) + " | Plafond: " + str(MAX_OPEN_USDC))
+    log.info("PnL charge: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -359,20 +400,32 @@ def run():
                 pnl_date = today
                 seen_trades.clear()
                 traded_windows.clear()
+                consecutive_losses = 0
                 save_daily_pnl(0.0)
 
             if check_stop_loss():
-                log.warning("Stop-loss atteint! Pause 1h.")
+                log.warning("Stop-loss journalier atteint! Pause 1h.")
                 time.sleep(3600)
+                continue
+
+            if check_take_profit():
+                log.info("Take profit journalier atteint! +" + str(round(daily_pnl, 2)) + " USDC - Pause jusqu'a demain.")
+                time.sleep(3600)
+                continue
+
+            if check_circuit_breaker():
+                reste = int(circuit_breaker_until - time.time())
+                log.warning("Circuit breaker actif - reprise dans " + str(reste // 60) + " min")
+                time.sleep(300)
                 continue
 
             hour_utc = datetime.now(timezone.utc).hour
             if hour_utc not in ACTIVE_HOURS:
-                log.info("Hors plage 7h-22h (" + str(hour_utc) + "h) - pause")
+                log.info("Hors plage 7h-21h (" + str(hour_utc) + "h) - pause")
                 time.sleep(300)
                 continue
 
-            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)))
+            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)) + " | Pertes consec: " + str(consecutive_losses))
 
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
@@ -381,14 +434,14 @@ def run():
                 if whales:
                     log.info(str(len(whales)) + " whale(s)!")
                     for w in whales:
-                        if check_stop_loss() or open_val() + 5.0 > MAX_OPEN_USDC:
+                        if check_stop_loss() or check_take_profit() or check_circuit_breaker() or open_val() + 5.0 > MAX_OPEN_USDC:
                             break
                         log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
                         time.sleep(5)
                         price = get_token_price(w["token_id"])
                         if price <= 0:
                             price = w["price"]
-                        if 0.45 <= price <= 0.65:
+                        if 0.35 <= price <= 0.75:
                             btc_now = get_btc_price()
                             if place_order(w["token_id"], w["outcome"], price, 5.0, btc_now):
                                 seen_trades.add(w["id"])
@@ -399,7 +452,7 @@ def run():
                 else:
                     log.info("Aucune whale")
 
-            if check_stop_loss():
+            if check_stop_loss() or check_take_profit() or check_circuit_breaker():
                 continue
 
             if open_val() < MAX_OPEN_USDC:
@@ -424,10 +477,10 @@ def run():
                     btc_current = get_btc_price()
                     market = get_btc_market(window_ts)
                     if market:
-                        if slope > 30:
+                        if slope > 50:
                             target = "Up"
                             log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -30:
+                        elif slope < -50:
                             target = "Down"
                             log.info("Signal DOWN " + str(round(slope)) + "$")
                         else:
@@ -435,18 +488,19 @@ def run():
                             log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
                         if target:
                             bet_size = calculate_bet_size(slope)
-                            for token in market.get("tokens", []):
-                                if token["outcome"] == target:
-                                    token_id = token["token_id"]
-                                    price = get_token_price(token_id)
-                                    if price <= 0:
-                                        price = 0.5
-                                    log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                    if 0.53 <= price <= 0.67:
-                                        if place_order(token_id, target, price, bet_size, btc_current):
-                                            traded_windows.add(window_ts)
-                                    else:
-                                        log.info("Prix hors fourchette: " + str(round(price, 2)))
+                            if bet_size > 0:
+                                for token in market.get("tokens", []):
+                                    if token["outcome"] == target:
+                                        token_id = token["token_id"]
+                                        price = get_token_price(token_id)
+                                        if price <= 0:
+                                            price = 0.5
+                                        log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
+                                        if 0.53 <= price <= 0.67:
+                                            if place_order(token_id, target, price, bet_size, btc_current):
+                                                traded_windows.add(window_ts)
+                                        else:
+                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
 
         except Exception as e:
             log.error("Erreur: " + str(e))
