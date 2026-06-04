@@ -19,7 +19,7 @@ BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "20"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 CIRCUIT_BREAKER_PAUSE = int(os.getenv("CIRCUIT_BREAKER_PAUSE", "7200"))  # 2h en secondes
 
-ACTIVE_HOURS = list(range(7, 21))
+ACTIVE_HOURS = list(range(7, 23))  # 7h a 22h UTC inclus
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API = "https://clob.polymarket.com"
@@ -283,7 +283,12 @@ def monitor_loop():
                 token_id = pos["token_id"]
                 current = get_token_price(token_id)
                 if current <= 0:
+                    pos["zero_count"] = pos.get("zero_count", 0) + 1
+                    if pos["zero_count"] >= 3:
+                        log.info("Position fermee manuellement - suppression propre")
+                        to_remove.append(pos)
                     continue
+                pos["zero_count"] = 0
                 entry = pos["entry_price"]
                 shares = pos["shares"]
                 btc_entry = pos.get("btc_entry", 0)
