@@ -19,6 +19,15 @@ BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "10"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 CIRCUIT_BREAKER_PAUSE = int(os.getenv("CIRCUIT_BREAKER_PAUSE", "7200"))
 
+# Parametres strategie courbe Polymarket
+TREND_SAMPLES = int(os.getenv("TREND_SAMPLES", "6"))          # 6 mesures x 10s = 60s observation
+TREND_SAMPLE_INTERVAL = int(os.getenv("TREND_SAMPLE_INTERVAL", "10"))  # 10s entre chaque mesure
+TREND_MIN_UP_STEPS = int(os.getenv("TREND_MIN_UP_STEPS", "4"))         # 4/6 mesures en hausse
+TREND_MAX_DROP = float(os.getenv("TREND_MAX_DROP", "0.05"))            # max 5c de chute d'un coup
+ENTRY_PRICE_MIN = float(os.getenv("ENTRY_PRICE_MIN", "0.55"))          # prix min pour entrer
+ENTRY_PRICE_MAX = float(os.getenv("ENTRY_PRICE_MAX", "0.80"))          # prix max pour entrer
+EXIT_REVERSAL = float(os.getenv("EXIT_REVERSAL", "0.10"))              # sortie si recul 10c
+
 ACTIVE_HOURS = list(range(7, 23))
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -89,30 +98,101 @@ def open_val():
     with positions_lock:
         return sum(p["size"] for p in open_positions)
 
-def calculate_bet_size(slope):
-    abs_slope = abs(slope)
-    if abs_slope >= 100:
-        bet = BET_SIZE_MAX        # 10 USDC max — jamais 20
-    elif abs_slope >= 50:
-        bet = BET_SIZE_MIN        # 5 USDC
-    else:
-        bet = 0.0                 # pas de trade
-    log.info("Pente: " + str(round(slope)) + "$ | Mise: " + str(bet) + " USDC")
-    return bet
-
-def is_market_valid(market):
-    end_date = market.get("endDateIso") or market.get("endDate")
-    if not end_date:
-        return False
+def get_token_price(token_id):
     try:
-        end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
-        now = datetime.now(timezone.utc)
-        hours_left = (end - now).total_seconds() / 3600
-        return 0 < hours_left <= MAX_MARKET_HOURS
+        r = requests.get(CLOB_API + "/last-trade-price", params={"token_id": token_id}, timeout=10)
+        if r.ok:
+            return float(r.json().get("price", 0))
+        return 0
     except:
-        return False
+        return 0
+
+def get_btc_price():
+    try:
+        r = requests.get(BINANCE_API + "/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=10)
+        if r.ok:
+            return float(r.json().get("price", 0))
+        return 0
+    except:
+        return 0
+
+def analyze_trend(token_id):
+    """
+    Observe le prix du token pendant 60 secondes (6 mesures x 10s).
+    Retourne (direction, prix_entree) si tendance confirmee, sinon (None, 0).
+
+    Regles cartesiennes :
+    - Prix entre ENTRY_PRICE_MIN et ENTRY_PRICE_MAX
+    - Au moins TREND_MIN_UP_STEPS mesures en hausse sur TREND_SAMPLES
+    - Aucune chute brutale > TREND_MAX_DROP
+    """
+    prices = []
+    log.info("Observation tendance courbe (" + str(TREND_SAMPLES) + " mesures x " + str(TREND_SAMPLE_INTERVAL) + "s)...")
+
+    for i in range(TREND_SAMPLES):
+        p = get_token_price(token_id)
+        if p > 0:
+            prices.append(p)
+            log.info("Mesure " + str(i+1) + "/" + str(TREND_SAMPLES) + " : " + str(round(p, 3)))
+        if i < TREND_SAMPLES - 1:
+            time.sleep(TREND_SAMPLE_INTERVAL)
+
+    if len(prices) < TREND_SAMPLES:
+        log.info("Pas assez de mesures - skip")
+        return None, 0
+
+    # Regle 1 : prix final dans la fourchette d'entree
+    prix_final = prices[-1]
+    if not (ENTRY_PRICE_MIN <= prix_final <= ENTRY_PRICE_MAX):
+        log.info("Prix hors fourchette entree (" + str(round(prix_final, 3)) + ") - skip")
+        return None, 0
+
+    # Regle 2 : compter les etapes en hausse
+    up_steps = sum(1 for i in range(1, len(prices)) if prices[i] > prices[i-1])
+    log.info("Etapes hausse: " + str(up_steps) + "/" + str(TREND_SAMPLES-1) + " | Min requis: " + str(TREND_MIN_UP_STEPS))
+
+    # Regle 3 : pas de chute brutale
+    max_drop = max((prices[i-1] - prices[i]) for i in range(1, len(prices)))
+    log.info("Chute max: " + str(round(max_drop, 3)) + " | Max autorise: " + str(TREND_MAX_DROP))
+
+    if max_drop > TREND_MAX_DROP:
+        log.info("Chute brutale detectee - tendance non confirmee")
+        return None, 0
+
+    if up_steps >= TREND_MIN_UP_STEPS:
+        log.info("Tendance confirmee - courbe monte regulierement")
+        return "hausse", prix_final
+    else:
+        log.info("Tendance non confirmee - courbe incertaine")
+        return None, 0
+
+def get_btc_market(window_ts):
+    try:
+        slug = "btc-updown-5m-" + str(window_ts)
+        r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
+        if r.ok:
+            data = r.json()
+            market = data[0] if isinstance(data, list) and len(data) > 0 else None
+            if market:
+                outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
+                token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
+                tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+                market["tokens"] = tokens
+                return market
+        return None
+    except:
+        return None
+
+def calculate_bet_size(price):
+    """
+    Mise selon le prix d'entree :
+    - Prix entre 0.55 et 0.65 -> mise max (plus de valeur potentielle)
+    - Prix entre 0.65 et 0.80 -> mise min (moins de valeur, plus de risque)
+    """
+    if price <= 0.65:
+        return BET_SIZE_MAX   # 10 USDC
+    else:
+        return BET_SIZE_MIN   # 5 USDC
 
 def get_active_markets():
     try:
@@ -120,7 +200,21 @@ def get_active_markets():
         if not r.ok:
             return []
         markets = r.json()
-        filtered = [m for m in markets if is_market_valid(m)]
+        filtered = []
+        for m in markets:
+            end_date = m.get("endDateIso") or m.get("endDate")
+            if not end_date:
+                continue
+            try:
+                end = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                if end.tzinfo is None:
+                    end = end.replace(tzinfo=timezone.utc)
+                now = datetime.now(timezone.utc)
+                hours_left = (end - now).total_seconds() / 3600
+                if 0 < hours_left <= MAX_MARKET_HOURS:
+                    filtered.append(m)
+            except:
+                continue
         log.info("Marches valides: " + str(len(filtered)))
         return filtered
     except Exception as e:
@@ -169,59 +263,6 @@ def detect_whales(markets):
                 seen_market_tokens.add(market_key)
     return whales
 
-def get_btc_price():
-    try:
-        r = requests.get(BINANCE_API + "/api/v3/ticker/price", params={"symbol": "BTCUSDT"}, timeout=10)
-        if r.ok:
-            return float(r.json().get("price", 0))
-        return 0
-    except:
-        return 0
-
-def get_btc_slope():
-    try:
-        r = requests.get(
-            BINANCE_API + "/api/v3/klines",
-            params={"symbol": "BTCUSDT", "interval": "1m", "limit": 5},
-            timeout=10
-        )
-        if not r.ok:
-            return 0
-        candles = r.json()
-        closes = [float(c[4]) for c in candles]
-        slope = closes[-1] - closes[0]
-        log.info("BTC courbe: " + str(round(closes[0])) + " -> " + str(round(closes[-1])) + " | Pente: " + str(round(slope)) + "$")
-        return slope
-    except Exception as e:
-        log.error("Erreur courbe BTC: " + str(e))
-        return 0
-
-def get_btc_market(window_ts):
-    try:
-        slug = "btc-updown-5m-" + str(window_ts)
-        r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
-        if r.ok:
-            data = r.json()
-            market = data[0] if isinstance(data, list) and len(data) > 0 else None
-            if market:
-                outcomes = json.loads(market.get("outcomes", "[]")) if isinstance(market.get("outcomes"), str) else market.get("outcomes", [])
-                token_ids = json.loads(market.get("clobTokenIds", "[]")) if isinstance(market.get("clobTokenIds"), str) else market.get("clobTokenIds", [])
-                tokens = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
-                market["tokens"] = tokens
-                return market
-        return None
-    except:
-        return None
-
-def get_token_price(token_id):
-    try:
-        r = requests.get(CLOB_API + "/last-trade-price", params={"token_id": token_id}, timeout=10)
-        if r.ok:
-            return float(r.json().get("price", 0))
-        return 0
-    except:
-        return 0
-
 async def sell_order_async(token_id, shares, reason, price):
     try:
         from polymarket import AsyncSecureClient
@@ -253,7 +294,7 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
                     open_positions.append({
                         "token_id": token_id, "entry_price": price, "shares": shares,
                         "size": bet_size, "outcome": outcome, "btc_entry": btc_entry,
-                        "side": outcome,
+                        "side": outcome, "peak_price": price,
                     })
                 return True
             log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -265,8 +306,17 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
 def place_order(token_id, outcome, price, bet_size, btc_entry):
     return asyncio.run(place_order_async(token_id, outcome, price, bet_size, btc_entry))
 
+def record_loss():
+    global consecutive_losses, circuit_breaker_until
+    consecutive_losses += 1
+    log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
+    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
+        circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
+        log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes - pause 2h")
+        consecutive_losses = 0
+
 def monitor_loop():
-    global daily_pnl, open_positions, consecutive_losses, circuit_breaker_until
+    global daily_pnl, open_positions
     log.info("Thread surveillance demarre - toutes les " + str(int(MONITOR_INTERVAL)) + "s")
     while True:
         try:
@@ -285,31 +335,34 @@ def monitor_loop():
                 if current <= 0:
                     pos["zero_count"] = pos.get("zero_count", 0) + 1
                     if pos["zero_count"] >= 3:
-                        log.info("Position fermee manuellement - suppression propre")
+                        log.info("Position fermee manuellement - suppression")
                         to_remove.append(pos)
                     continue
                 pos["zero_count"] = 0
 
                 entry = pos["entry_price"]
                 shares = pos["shares"]
-                btc_entry = pos.get("btc_entry", 0)
+                peak = pos.get("peak_price", entry)
                 side = pos.get("side", "Up")
-                log.info("Monitor | " + side + " | Token: " + str(round(current, 2)) + " | BTC: " + str(round(btc_current)))
 
+                # Met a jour le peak
+                if current > peak:
+                    pos["peak_price"] = current
+                    peak = current
+
+                log.info("Monitor | " + side + " | Token: " + str(round(current, 3)) + " | Peak: " + str(round(peak, 3)) + " | BTC: " + str(round(btc_current)))
+
+                # Marche expire - perte
                 if current <= 0.02:
                     log.info("Marche expire - PERTE")
                     pnl = (current - entry) * shares
                     daily_pnl += pnl
                     save_daily_pnl(daily_pnl)
-                    consecutive_losses += 1
-                    log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
-                    if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                        circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
-                        log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes - pause 2h")
-                        consecutive_losses = 0
+                    record_loss()
                     to_remove.append(pos)
                     continue
 
+                # Marche expire - gain
                 elif current >= 0.98:
                     log.info("Marche expire - GAIN!")
                     pnl = (current - entry) * shares
@@ -320,8 +373,9 @@ def monitor_loop():
                     to_remove.append(pos)
                     continue
 
+                # Take profit
                 elif current >= TAKE_PROFIT_PRICE:
-                    log.info("TAKE PROFIT! @ " + str(round(current, 2)))
+                    log.info("TAKE PROFIT! @ " + str(round(current, 3)))
                     if sell_order(token_id, shares, "TP", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
@@ -330,32 +384,40 @@ def monitor_loop():
                         log.info("PnL TP: +" + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
 
+                # Stop loss prix
                 elif current <= STOP_LOSS_PRICE:
-                    log.info("STOP LOSS! @ " + str(round(current, 2)))
+                    log.info("STOP LOSS! @ " + str(round(current, 3)))
                     if sell_order(token_id, shares, "SL", current):
                         pnl = (current - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
-                        consecutive_losses += 1
-                        log.info("Pertes consecutives: " + str(consecutive_losses) + "/" + str(MAX_CONSECUTIVE_LOSSES))
-                        if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                            circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
-                            log.warning("CIRCUIT BREAKER! " + str(MAX_CONSECUTIVE_LOSSES) + " pertes - pause 2h")
-                            consecutive_losses = 0
+                        record_loss()
                         to_remove.append(pos)
 
-                elif btc_entry > 0 and btc_current > 0:
+                # Sortie si retournement apres entree (courbe se retourne de EXIT_REVERSAL)
+                elif peak - current >= EXIT_REVERSAL and current > entry:
+                    log.info("SORTIE RETOURNEMENT! Peak: " + str(round(peak, 3)) + " -> Now: " + str(round(current, 3)))
+                    if sell_order(token_id, shares, "REVERSAL", current):
+                        pnl = (current - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        if pnl < 0:
+                            record_loss()
+                        else:
+                            consecutive_losses = 0
+                        log.info("PnL sortie: " + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
+                        to_remove.append(pos)
+
+                # Stop BTC deviation
+                elif pos.get("btc_entry", 0) > 0 and btc_current > 0:
+                    btc_entry = pos["btc_entry"]
                     if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
                         log.info("STOP BTC DOWN!")
                         if sell_order(token_id, shares, "SL_BTC", current):
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
-                            consecutive_losses += 1
-                            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                                circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
-                                log.warning("CIRCUIT BREAKER! pause 2h")
-                                consecutive_losses = 0
+                            record_loss()
                             to_remove.append(pos)
                     elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
                         log.info("STOP BTC UP!")
@@ -363,11 +425,7 @@ def monitor_loop():
                             pnl = (current - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
-                            consecutive_losses += 1
-                            if consecutive_losses >= MAX_CONSECUTIVE_LOSSES:
-                                circuit_breaker_until = time.time() + CIRCUIT_BREAKER_PAUSE
-                                log.warning("CIRCUIT BREAKER! pause 2h")
-                                consecutive_losses = 0
+                            record_loss()
                             to_remove.append(pos)
 
             if to_remove:
@@ -381,8 +439,8 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_markets, consecutive_losses
-    log.info("Bot Smart v4 - BTC Binance - Mises 5/10 - TP 60$ - SL 30$ - Circuit 3 pertes")
-    log.info("Mise: " + str(BET_SIZE_MIN) + "-" + str(BET_SIZE_MAX) + " USDC | SL: " + str(STOP_LOSS_USDC) + " | TP jour: " + str(DAILY_TAKE_PROFIT) + " | Monitor: " + str(int(MONITOR_INTERVAL)) + "s")
+    log.info("Bot Smart v5 - Strategie courbe Polymarket - Mises 5/10 - Circuit 3 pertes 2h")
+    log.info("SL: " + str(STOP_LOSS_USDC) + "$ | TP jour: " + str(DAILY_TAKE_PROFIT) + "$ | Monitor: " + str(int(MONITOR_INTERVAL)) + "s | Observation: " + str(TREND_SAMPLES * TREND_SAMPLE_INTERVAL) + "s")
     log.info("PnL charge: " + str(round(daily_pnl, 2)))
 
     if not PRIVATE_KEY.startswith("0x"):
@@ -408,30 +466,30 @@ def run():
                 save_daily_pnl(0.0)
 
             if check_stop_loss():
-                log.warning("Stop-loss journalier atteint! Pause 1h.")
+                log.warning("Stop-loss journalier! Pause 1h.")
                 time.sleep(3600)
                 continue
 
             if check_take_profit():
-                log.info("Take profit journalier atteint! +" + str(round(daily_pnl, 2)) + " USDC - Pause jusqu'a demain.")
+                log.info("Take profit journalier! +" + str(round(daily_pnl, 2)) + "$ - Pause jusqu'a demain.")
                 time.sleep(3600)
                 continue
 
             if check_circuit_breaker():
                 reste = int(circuit_breaker_until - time.time())
-                log.warning("Circuit breaker actif - reprise dans " + str(reste // 60) + " min")
+                log.warning("Circuit breaker - reprise dans " + str(reste // 60) + " min")
                 time.sleep(300)
                 continue
 
             hour_utc = datetime.now(timezone.utc).hour
             if hour_utc not in ACTIVE_HOURS:
-                log.info("Hors plage 7h-22h (" + str(hour_utc) + "h) - pause")
+                log.info("Hors plage 7h-22h UTC - pause")
                 time.sleep(300)
                 continue
 
-            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)) + " | Pertes consec: " + str(consecutive_losses))
+            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)) + " | Pertes: " + str(consecutive_losses))
 
-            # STRATEGIE 1 : Copy Whales — 1 seule whale par cycle
+            # STRATEGIE 1 : Copy Whales — 1 seule par cycle
             if open_val() < MAX_OPEN_USDC:
                 log.info("=== COPY WHALES ===")
                 markets = get_active_markets()
@@ -463,9 +521,9 @@ def run():
             if check_stop_loss() or check_take_profit() or check_circuit_breaker():
                 continue
 
-            # STRATEGIE 2 : BTC 5M
+            # STRATEGIE 2 : BTC 5M — analyse courbe Polymarket
             if open_val() < MAX_OPEN_USDC:
-                log.info("=== BTC 5M ===")
+                log.info("=== BTC 5M - ANALYSE COURBE ===")
                 now = int(time.time())
                 seconds_in_window = now % 300
                 window_ts = now - seconds_in_window
@@ -473,47 +531,59 @@ def run():
                 if window_ts in traded_windows:
                     log.info("Fenetre deja tradee")
                 else:
-                    if seconds_in_window > 90:
-                        seconds_to_next = 300 - seconds_in_window
-                        log.info("Trop tard (" + str(seconds_in_window) + "s) - attente " + str(seconds_to_next) + "s")
-                        time.sleep(seconds_to_next)
-                        now = int(time.time())
-                        window_ts = now - (now % 300)
-                        seconds_in_window = 0
+                    # On entre dans la fenetre entre 30s et 90s apres le debut
+                    # pour avoir du temps d'observation avant l'expiration
                     if seconds_in_window < 30:
-                        log.info("Attente 30s stabilisation...")
-                        time.sleep(30)
+                        log.info("Trop tot (" + str(seconds_in_window) + "s) - attente stabilisation")
+                        time.sleep(30 - seconds_in_window)
+                        now = int(time.time())
+                        seconds_in_window = now % 300
 
-                    slope = get_btc_slope()
-                    btc_current = get_btc_price()
-                    market = get_btc_market(window_ts)
+                    if seconds_in_window > 120:
+                        log.info("Trop tard pour observer (" + str(seconds_in_window) + "s) - prochaine fenetre")
+                    else:
+                        market = get_btc_market(window_ts)
+                        if market:
+                            tokens = market.get("tokens", [])
+                            up_token = next((t for t in tokens if t["outcome"] == "Up"), None)
+                            down_token = next((t for t in tokens if t["outcome"] == "Down"), None)
 
-                    if market:
-                        if slope > 50:
-                            target = "Up"
-                            log.info("Signal UP +" + str(round(slope)) + "$")
-                        elif slope < -50:
-                            target = "Down"
-                            log.info("Signal DOWN " + str(round(slope)) + "$")
+                            if up_token and down_token:
+                                price_up = get_token_price(up_token["token_id"])
+                                price_down = get_token_price(down_token["token_id"])
+                                log.info("Marche BTC | Up: " + str(round(price_up, 3)) + " | Down: " + str(round(price_down, 3)))
+
+                                # Determine quel cote analyser
+                                # On analyse le cote qui monte (le plus proche de ENTRY_PRICE_MAX)
+                                # et qui est dans la fourchette d'entree
+                                target_token = None
+                                target_outcome = None
+
+                                if ENTRY_PRICE_MIN <= price_down <= ENTRY_PRICE_MAX:
+                                    target_token = down_token["token_id"]
+                                    target_outcome = "Down"
+                                    log.info("Candidat: Down @ " + str(round(price_down, 3)) + " - analyse tendance...")
+                                elif ENTRY_PRICE_MIN <= price_up <= ENTRY_PRICE_MAX:
+                                    target_token = up_token["token_id"]
+                                    target_outcome = "Up"
+                                    log.info("Candidat: Up @ " + str(round(price_up, 3)) + " - analyse tendance...")
+                                else:
+                                    log.info("Aucun cote dans fourchette entree " + str(ENTRY_PRICE_MIN) + "-" + str(ENTRY_PRICE_MAX) + " - pas de trade")
+
+                                if target_token:
+                                    # Analyse la tendance de la courbe
+                                    trend, prix_entree = analyze_trend(target_token)
+
+                                    if trend == "hausse":
+                                        bet_size = calculate_bet_size(prix_entree)
+                                        btc_now = get_btc_price()
+                                        log.info("ENTREE VALIDEE | " + target_outcome + " @ " + str(round(prix_entree, 3)) + " | Mise: " + str(bet_size) + " USDC")
+                                        if place_order(target_token, target_outcome, prix_entree, bet_size, btc_now):
+                                            traded_windows.add(window_ts)
+                                    else:
+                                        log.info("Tendance non confirmee - pas de trade cette fenetre")
                         else:
-                            target = None
-                            log.info("Pente faible (" + str(round(slope)) + "$) - pas de trade")
-
-                        if target:
-                            bet_size = calculate_bet_size(slope)
-                            if bet_size > 0:
-                                for token in market.get("tokens", []):
-                                    if token["outcome"] == target:
-                                        token_id = token["token_id"]
-                                        price = get_token_price(token_id)
-                                        if price <= 0:
-                                            price = 0.5
-                                        log.info(target + " @ " + str(round(price, 2)) + " | Mise: " + str(bet_size) + " USDC")
-                                        if 0.53 <= price <= 0.67:
-                                            if place_order(token_id, target, price, bet_size, btc_current):
-                                                traded_windows.add(window_ts)
-                                        else:
-                                            log.info("Prix hors fourchette: " + str(round(price, 2)))
+                            log.info("Marche BTC 5M non trouve")
 
         except Exception as e:
             log.error("Erreur: " + str(e))
