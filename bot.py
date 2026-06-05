@@ -1,4 +1,4 @@
-import os, time, random, logging, requests, json, asyncio
+import os, time, random, logging, requests, json, asyncio, math
 from datetime import date, datetime, timezone
 import threading
 
@@ -256,7 +256,7 @@ def sell_order(token_id, shares, reason, price):
 async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
     try:
         from polymarket import AsyncSecureClient
-        shares = round(bet_size / price, 2)
+        shares = math.floor(bet_size / price * 100) / 100
         async with await AsyncSecureClient.create(private_key=PRIVATE_KEY, wallet=WALLET) as client:
             response = await client.place_limit_order(token_id=token_id, side="BUY",
                 price=str(round(price, 4)), size=str(shares))
