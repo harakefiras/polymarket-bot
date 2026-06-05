@@ -1,4 +1,4 @@
-import os, time, random, logging, requests, json, asyncio, math
+import os, time, logging, requests, json, asyncio, math
 from datetime import date, datetime, timezone
 import threading
 
@@ -17,12 +17,13 @@ BET_SIZE_MIN = float(os.getenv("BET_SIZE_MIN", "5"))
 BET_SIZE_MAX = float(os.getenv("BET_SIZE_MAX", "10"))
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("MAX_CONSECUTIVE_LOSSES", "3"))
 CIRCUIT_BREAKER_PAUSE = int(os.getenv("CIRCUIT_BREAKER_PAUSE", "7200"))
-TREND_SAMPLES = int(os.getenv("TREND_SAMPLES", "4"))
-TREND_SAMPLE_INTERVAL = int(os.getenv("TREND_SAMPLE_INTERVAL", "10"))
-TREND_MAX_DROP = float(os.getenv("TREND_MAX_DROP", "0.05"))
-ENTRY_PRICE_MIN = float(os.getenv("ENTRY_PRICE_MIN", "0.52"))
-ENTRY_PRICE_MAX = float(os.getenv("ENTRY_PRICE_MAX", "0.75"))
-EXIT_REVERSAL = float(os.getenv("EXIT_REVERSAL", "0.10"))
+
+# Nouveaux criteres d'entree
+ENTRY_PRICE_MIN = float(os.getenv("ENTRY_PRICE_MIN", "0.52"))   # prix min > 52c
+ENTRY_PRICE_MAX = float(os.getenv("ENTRY_PRICE_MAX", "0.80"))   # prix max
+BTC_MOVE_MIN = float(os.getenv("BTC_MOVE_MIN", "80"))           # variation BTC min en $
+BTC_OBSERVE_SECONDS = int(os.getenv("BTC_OBSERVE_SECONDS", "60")) # duree observation BTC
+EXIT_REVERSAL = float(os.getenv("EXIT_REVERSAL", "0.10"))        # sortie si recul 10c
 
 ACTIVE_HOURS = list(range(7, 23))
 
@@ -31,6 +32,7 @@ CLOB_API = "https://clob.polymarket.com"
 DATA_API = "https://data-api.polymarket.com"
 BINANCE_API = "https://api.binance.com"
 TRADED_FILE = "/app/traded_markets.txt"
+WINDOWS_FILE = "/app/traded_windows.txt"
 PNL_FILE = "/app/daily_pnl.txt"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
@@ -54,10 +56,35 @@ def save_daily_pnl(pnl):
     except:
         pass
 
+def load_traded_windows():
+    """Charge les fenetres deja tradees depuis le disque — persist apres redemarrage"""
+    try:
+        if os.path.exists(WINDOWS_FILE):
+            with open(WINDOWS_FILE, "r") as f:
+                lines = f.read().strip().split("\n")
+                today = str(date.today())
+                windows = set()
+                for line in lines:
+                    if line.strip() and line.startswith(today):
+                        parts = line.strip().split(",")
+                        if len(parts) == 2:
+                            windows.add(int(parts[1]))
+                return windows
+        return set()
+    except:
+        return set()
+
+def save_traded_window(window_ts):
+    try:
+        with open(WINDOWS_FILE, "a") as f:
+            f.write(str(date.today()) + "," + str(window_ts) + "\n")
+    except:
+        pass
+
 daily_pnl = load_daily_pnl()
 pnl_date = date.today()
 seen_trades = set()
-traded_windows = set()
+traded_windows = load_traded_windows()
 open_positions = []
 positions_lock = threading.Lock()
 consecutive_losses = 0
@@ -112,36 +139,45 @@ def get_btc_price():
     except:
         return 0
 
-def analyze_trend(token_id):
-    prices = []
-    log.info("Observation tendance (" + str(TREND_SAMPLES) + " mesures x " + str(TREND_SAMPLE_INTERVAL) + "s)...")
-    for i in range(TREND_SAMPLES):
-        p = get_token_price(token_id)
-        if p > 0:
-            prices.append(p)
-            log.info("Mesure " + str(i+1) + "/" + str(TREND_SAMPLES) + " : " + str(round(p, 3)))
-        if i < TREND_SAMPLES - 1:
-            time.sleep(TREND_SAMPLE_INTERVAL)
+def analyze_signal(token_id, direction):
+    """
+    Observe pendant BTC_OBSERVE_SECONDS (60s) :
+    1. Prix du token doit rester > ENTRY_PRICE_MIN (52c)
+    2. BTC doit bouger de plus de BTC_MOVE_MIN ($80) dans le bon sens
+    Retourne (True, prix_entree) si signal valide, sinon (False, 0)
+    """
+    btc_start = get_btc_price()
+    prix_entree = get_token_price(token_id)
 
-    if len(prices) < TREND_SAMPLES:
-        log.info("Pas assez de mesures - skip")
-        return None, 0
+    if btc_start <= 0 or prix_entree <= 0:
+        return False, 0
 
-    max_drop = max((prices[i-1] - prices[i]) for i in range(1, len(prices)))
-    log.info("Chute max: " + str(round(max_drop, 3)) + " | Max autorise: " + str(TREND_MAX_DROP))
+    log.info("Observation 60s | BTC depart: " + str(round(btc_start)) + " | Token: " + str(round(prix_entree, 3)))
 
-    prix_entree = prices[0]
+    time.sleep(BTC_OBSERVE_SECONDS)
 
-    if not (ENTRY_PRICE_MIN <= prix_entree <= ENTRY_PRICE_MAX):
-        log.info("Prix entree hors fourchette (" + str(round(prix_entree, 3)) + ") - skip")
-        return None, 0
+    btc_end = get_btc_price()
+    btc_move = btc_end - btc_start
+    prix_final = get_token_price(token_id)
 
-    if prices[-1] > prices[0] and max_drop <= TREND_MAX_DROP:
-        log.info("Tendance confirmee - prix monte globalement")
-        return "hausse", prix_entree
-    else:
-        log.info("Tendance non confirmee")
-        return None, 0
+    log.info("BTC fin: " + str(round(btc_end)) + " | Move: " + str(round(btc_move, 1)) + "$ | Token final: " + str(round(prix_final, 3)))
+
+    # Regle 1 : variation BTC suffisante dans le bon sens
+    if direction == "Down" and btc_move > -BTC_MOVE_MIN:
+        log.info("BTC pas assez baisse (" + str(round(btc_move, 1)) + "$ < -" + str(BTC_MOVE_MIN) + "$) - skip")
+        return False, 0
+
+    if direction == "Up" and btc_move < BTC_MOVE_MIN:
+        log.info("BTC pas assez monte (" + str(round(btc_move, 1)) + "$ < +" + str(BTC_MOVE_MIN) + "$) - skip")
+        return False, 0
+
+    # Regle 2 : prix final toujours dans fourchette
+    if not (ENTRY_PRICE_MIN <= prix_final <= ENTRY_PRICE_MAX):
+        log.info("Prix final hors fourchette (" + str(round(prix_final, 3)) + ") - skip")
+        return False, 0
+
+    log.info("Signal valide! BTC: " + str(round(btc_move, 1)) + "$ | Token: " + str(round(prix_final, 3)))
+    return True, prix_final
 
 def get_btc_market(window_ts):
     try:
@@ -402,10 +438,10 @@ def monitor_loop():
         time.sleep(MONITOR_INTERVAL)
 
 def run():
-    global daily_pnl, pnl_date, traded_markets, consecutive_losses
-    log.info("Bot Smart v6 - Courbe Polymarket - Scan continu - Mises 5/10 - Circuit 3 pertes 2h")
-    log.info("SL: " + str(STOP_LOSS_USDC) + "$ | TP: " + str(DAILY_TAKE_PROFIT) + "$ | Fourchette: " + str(ENTRY_PRICE_MIN) + "-" + str(ENTRY_PRICE_MAX))
-    log.info("PnL charge: " + str(round(daily_pnl, 2)))
+    global daily_pnl, pnl_date, traded_markets, traded_windows, consecutive_losses
+    log.info("Bot Smart v7 - BTC Move + Prix > 52c - Mises 5/10 - Circuit 3 pertes 2h")
+    log.info("SL: " + str(STOP_LOSS_USDC) + "$ | TP: " + str(DAILY_TAKE_PROFIT) + "$ | BTC move min: " + str(BTC_MOVE_MIN) + "$ | Observation: " + str(BTC_OBSERVE_SECONDS) + "s")
+    log.info("PnL charge: " + str(round(daily_pnl, 2)) + " | Fenetres deja tradees: " + str(len(traded_windows)))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -450,6 +486,8 @@ def run():
                 time.sleep(60)
                 continue
 
+            log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)) + " | Pertes: " + str(consecutive_losses))
+
             # STRATEGIE 1 : Copy Whales — 1 seule par cycle
             if open_val() < MAX_OPEN_USDC:
                 markets = get_active_markets()
@@ -480,46 +518,51 @@ def run():
                 time.sleep(10)
                 continue
 
-            # STRATEGIE 2 : BTC 5M — scan continu
+            # STRATEGIE 2 : BTC 5M — BTC move + prix > 52c
             if open_val() < MAX_OPEN_USDC:
                 now = int(time.time())
                 seconds_in_window = now % 300
                 window_ts = now - seconds_in_window
 
-                if window_ts not in traded_windows:
-                    # Entre dans la fenetre entre 30s et 250s
-                    if 30 <= seconds_in_window <= 250:
-                        market = get_btc_market(window_ts)
-                        if market:
-                            tokens = market.get("tokens", [])
-                            up_token = next((t for t in tokens if t["outcome"] == "Up"), None)
-                            down_token = next((t for t in tokens if t["outcome"] == "Down"), None)
+                if window_ts in traded_windows:
+                    pass  # fenetre deja tradee - skip silencieux
+                elif seconds_in_window < 30:
+                    pass  # trop tot - attendre
+                elif seconds_in_window > 200:
+                    pass  # plus assez de temps pour observer 60s
+                else:
+                    market = get_btc_market(window_ts)
+                    if market:
+                        tokens = market.get("tokens", [])
+                        up_token = next((t for t in tokens if t["outcome"] == "Up"), None)
+                        down_token = next((t for t in tokens if t["outcome"] == "Down"), None)
 
-                            if up_token and down_token:
-                                price_up = get_token_price(up_token["token_id"])
-                                price_down = get_token_price(down_token["token_id"])
-                                log.info("BTC | Up: " + str(round(price_up, 3)) + " | Down: " + str(round(price_down, 3)))
+                        if up_token and down_token:
+                            price_up = get_token_price(up_token["token_id"])
+                            price_down = get_token_price(down_token["token_id"])
+                            log.info("BTC | Up: " + str(round(price_up, 3)) + " | Down: " + str(round(price_down, 3)))
 
-                                target_token = None
-                                target_outcome = None
+                            target_token = None
+                            target_outcome = None
 
-                                if ENTRY_PRICE_MIN <= price_down <= ENTRY_PRICE_MAX:
-                                    target_token = down_token["token_id"]
-                                    target_outcome = "Down"
-                                    log.info("Candidat: Down @ " + str(round(price_down, 3)))
-                                elif ENTRY_PRICE_MIN <= price_up <= ENTRY_PRICE_MAX:
-                                    target_token = up_token["token_id"]
-                                    target_outcome = "Up"
-                                    log.info("Candidat: Up @ " + str(round(price_up, 3)))
+                            if ENTRY_PRICE_MIN <= price_down <= ENTRY_PRICE_MAX:
+                                target_token = down_token["token_id"]
+                                target_outcome = "Down"
+                                log.info("Candidat: Down @ " + str(round(price_down, 3)) + " - observation 60s...")
+                            elif ENTRY_PRICE_MIN <= price_up <= ENTRY_PRICE_MAX:
+                                target_token = up_token["token_id"]
+                                target_outcome = "Up"
+                                log.info("Candidat: Up @ " + str(round(price_up, 3)) + " - observation 60s...")
 
-                                if target_token:
-                                    trend, prix_entree = analyze_trend(target_token)
-                                    if trend == "hausse":
-                                        bet_size = calculate_bet_size(prix_entree)
-                                        btc_now = get_btc_price()
-                                        log.info("ENTREE VALIDEE | " + target_outcome + " @ " + str(round(prix_entree, 3)) + " | Mise: " + str(bet_size) + " USDC")
-                                        if place_order(target_token, target_outcome, prix_entree, bet_size, btc_now):
-                                            traded_windows.add(window_ts)
+                            if target_token:
+                                valide, prix_entree = analyze_signal(target_token, target_outcome)
+                                if valide:
+                                    bet_size = calculate_bet_size(prix_entree)
+                                    btc_now = get_btc_price()
+                                    log.info("ENTREE VALIDEE | " + target_outcome + " @ " + str(round(prix_entree, 3)) + " | Mise: " + str(bet_size) + " USDC")
+                                    if place_order(target_token, target_outcome, prix_entree, bet_size, btc_now):
+                                        traded_windows.add(window_ts)
+                                        save_traded_window(window_ts)
 
         except Exception as e:
             log.error("Erreur: " + str(e))
