@@ -107,7 +107,6 @@ open_positions = []
 positions_lock = threading.Lock()
 consecutive_losses = 0
 circuit_breaker_until = 0
-load_strikes()
 
 def check_stop_loss():
     return daily_pnl <= -STOP_LOSS_USDC
@@ -318,6 +317,10 @@ def monitor_loop():
 
 def run():
     global daily_pnl, pnl_date, traded_windows, consecutive_losses
+    try:
+        load_strikes()
+    except:
+        pass
     log.info("Bot Smart v8 - Prix a Battre - Gap 30$ - 1ere minute - Token 0.52-0.75")
     log.info("SL: " + str(STOP_LOSS_USDC) + "$ | TP: " + str(DAILY_TAKE_PROFIT) + "$ | Gap min: " + str(GAP_MIN) + "$")
     log.info("PnL: " + str(round(daily_pnl, 2)) + " | Fenetres tradees: " + str(len(traded_windows)))
