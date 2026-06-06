@@ -194,6 +194,7 @@ async def place_order_async(token_id, outcome, price, bet_size, btc_entry):
                         "token_id": token_id, "entry_price": price, "shares": shares,
                         "size": bet_size, "outcome": outcome, "btc_entry": btc_entry,
                         "side": outcome, "peak_price": price,
+                        "window_ts": (int(time.time()) - int(time.time()) % 300),
                     })
                 return True
             log.error("Erreur ordre: " + str(response.code) + " " + str(response.message))
@@ -288,6 +289,15 @@ def monitor_loop():
                             record_loss()
                         else:
                             consecutive_losses = 0
+                        log.info("PnL: " + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
+                        to_remove.append(pos)
+                elif pos.get("window_ts", 0) > 0 and (int(time.time()) - pos["window_ts"]) >= 240 and current < entry:
+                    log.info("VENTE FORCEE DERNIERE MINUTE @ " + str(round(current, 3)))
+                    if sell_order(token_id, shares, "FORCE_FIN", current):
+                        pnl = (current - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        record_loss()
                         log.info("PnL: " + str(round(pnl, 2)) + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
                 elif pos.get("btc_entry", 0) > 0 and btc_current > 0:
