@@ -32,7 +32,9 @@ WINDOWS_FILE = "/app/traded_windows.txt"
 PNL_FILE = "/app/daily_pnl.txt"
 STRIKE_FILE = "/app/strikes.txt"
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+import sys
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", stream=sys.stdout)
+sys.stdout.reconfigure(line_buffering=True)
 log = logging.getLogger("bot")
 
 def load_daily_pnl():
