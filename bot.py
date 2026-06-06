@@ -458,30 +458,6 @@ def run():
 
             log.info("Positions: " + str(round(open_val(), 2)) + "/" + str(MAX_OPEN_USDC) + " | PnL: " + str(round(daily_pnl, 2)) + " | Pertes: " + str(consecutive_losses))
 
-            # STRATEGIE 1 : Copy Whales
-            if open_val() < MAX_OPEN_USDC:
-                markets = get_active_markets()
-                whales = detect_whales(markets)
-                if whales:
-                    log.info(str(len(whales)) + " whale(s)!")
-                    for w in whales:
-                        if check_stop_loss() or check_take_profit() or check_circuit_breaker():
-                            break
-                        if open_val() + 5.0 > MAX_OPEN_USDC:
-                            break
-                        log.info("Whale: " + str(round(w["notional"])) + " USDC | " + w["market"][:40] + " | " + w["outcome"] + " @ " + str(round(w["price"], 2)))
-                        time.sleep(5)
-                        price = get_token_price(w["token_id"])
-                        if price <= 0:
-                            price = w["price"]
-                        if 0.35 <= price <= 0.75:
-                            btc_now = get_btc_price()
-                            if place_order(w["token_id"], w["outcome"], price, 5.0, btc_now):
-                                seen_trades.add(w["id"])
-                                traded_markets.add(w["market_id"])
-                                save_traded_market(w["market_id"])
-                                break
-
             if check_stop_loss() or check_take_profit() or check_circuit_breaker():
                 time.sleep(10)
                 continue
