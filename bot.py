@@ -51,7 +51,7 @@ ENTRY_WINDOW_MAX = int(os.getenv("ENTRY_WINDOW_MAX",   "60"))
 
 # Plage horaire : 7h-14h (UTC = heure Abidjan)
 # On garde la plage eprouvee, pas 7h-23h qui dilue les signaux
-ACTIVE_HOURS = list(range(7, 22))
+ACTIVE_HOURS = list(range(7, 23))
 
 # APIs
 GAMMA_API = "https://gamma-api.polymarket.com"
