@@ -222,9 +222,9 @@ def get_btc_market(window_ts):
 
 def calculate_bet_size(price):
     if price <= 0.58:
-        return BET_SIZE_MAX   # 10 USDC
+        return BET_SIZE_MIN   # 5 USDC — token pas cher, marché pas encore convaincu
     else:
-        return BET_SIZE_MIN   # 5 USDC
+        return BET_SIZE_MAX   # 10 USDC — token cher, momentum confirmé, on mise plus
 
 # ============================================================
 # ORDRES POLYMARKET
