@@ -51,7 +51,7 @@ ENTRY_WINDOW_MAX = int(os.getenv("ENTRY_WINDOW_MAX",   "60"))
 
 # Plage horaire : 7h-14h (UTC = heure Abidjan)
 # On garde la plage eprouvee, pas 7h-23h qui dilue les signaux
-ACTIVE_HOURS = list(range(7, 23))
+ACTIVE_HOURS = list(range(7, 22))
 
 # APIs
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -233,11 +233,14 @@ def calculate_bet_size(price):
 async def sell_order_async(token_id, shares, reason, price):
     try:
         from polymarket import AsyncSecureClient
+        # Arrondi conservateur : on retire 0.01 share pour eviter
+        # l'erreur "not enough balance" due aux frais
+        shares_safe = max(0.01, round(shares - 0.01, 2))
         async with await AsyncSecureClient.create(
                 private_key=PRIVATE_KEY, wallet=WALLET) as client:
             response = await client.place_limit_order(
                 token_id=token_id, side="SELL",
-                price=str(round(price, 4)), size=str(round(shares, 2)))
+                price=str(round(price, 4)), size=str(shares_safe))
             if response.ok:
                 log.info("VENTE " + reason + " @ " + str(round(price, 2)))
                 return True
