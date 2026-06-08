@@ -245,11 +245,13 @@ def calculate_bet_size(price):
 async def sell_order_async(token_id, shares, reason, price):
     try:
         from polymarket import AsyncSecureClient
+        # Arrondi conservateur pour eviter l'erreur "not enough balance"
+        shares_safe = max(0.01, round(shares - 0.01, 2))
         async with await AsyncSecureClient.create(
                 private_key=PRIVATE_KEY, wallet=WALLET) as client:
             response = await client.place_limit_order(
                 token_id=token_id, side="SELL",
-                price=str(round(price, 4)), size=str(round(shares, 2)))
+                price=str(round(price, 4)), size=str(shares_safe))
             if response.ok:
                 log.info("VENTE " + reason + " @ " + str(round(price, 2)))
                 return True
