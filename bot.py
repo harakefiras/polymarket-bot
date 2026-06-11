@@ -188,6 +188,33 @@ def get_token_price(token_id):
     except:
         return 0
 
+
+def get_best_ask(token_id):
+    """Vrai prix d'ACHAT disponible (carnet d'ordres)."""
+    try:
+        r = requests.get(CLOB_API + "/book",
+                         params={"token_id": token_id}, timeout=8)
+        if r.ok:
+            asks = r.json().get("asks", [])
+            if asks:
+                return float(min(asks, key=lambda a: float(a["price"]))["price"])
+        return None
+    except:
+        return None
+
+def get_best_bid(token_id):
+    """Vrai prix de VENTE disponible (carnet d'ordres)."""
+    try:
+        r = requests.get(CLOB_API + "/book",
+                         params={"token_id": token_id}, timeout=8)
+        if r.ok:
+            bids = r.json().get("bids", [])
+            if bids:
+                return float(max(bids, key=lambda b: float(b["price"]))["price"])
+        return None
+    except:
+        return None
+
 def get_btc_market(window_ts):
     try:
         slug = "btc-updown-5m-" + str(window_ts)
@@ -367,7 +394,10 @@ def monitor_loop():
 
             for pos in positions_copy:
                 token_id = pos["token_id"]
-                current  = get_token_price(token_id)
+                # Prix vendable REEL (best bid), fallback dernier prix echange
+                current  = get_best_bid(token_id)
+                if current is None:
+                    current = get_token_price(token_id)
                 side     = pos.get("side", "Up")
                 entry    = pos["entry_price"]
                 shares   = pos["shares"]
@@ -607,7 +637,10 @@ def run():
                             (t for t in tokens if t["outcome"] == target_outcome),
                             None)
                         if target:
-                            price = get_token_price(target["token_id"])
+                            # Vrai prix d'achat (best ask), fallback last-trade
+                            price = get_best_ask(target["token_id"])
+                            if price is None:
+                                price = get_token_price(target["token_id"])
                             log.info(target_outcome + " token @ "
                                      + str(round(price, 3)))
 
