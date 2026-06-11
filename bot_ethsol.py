@@ -14,7 +14,7 @@ PRIVATE_KEY  = os.environ.get("PRIVATE_KEY", "")
 WALLET       = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
 # Stop loss / take profit journaliers (communs aux deux marchés)
-STOP_LOSS_USDC    = float(os.getenv("ETHSOL_STOP_LOSS_USDC",    "30"))
+STOP_LOSS_USDC    = float(os.getenv("ETHSOL_STOP_LOSS_USDC",    "15"))
 DAILY_TAKE_PROFIT = float(os.getenv("ETHSOL_DAILY_TAKE_PROFIT", "60"))
 MAX_OPEN_USDC     = float(os.getenv("ETHSOL_MAX_OPEN_USDC",     "20"))
 
@@ -26,9 +26,8 @@ EXIT_REVERSAL     = float(os.getenv("ETHSOL_EXIT_REVERSAL",     "0.10"))
 # Surveillance
 MONITOR_INTERVAL  = float(os.getenv("ETHSOL_MONITOR_INTERVAL",  "10"))
 
-# Mises
-BET_SIZE_MIN = float(os.getenv("ETHSOL_BET_SIZE_MIN", "5"))
-BET_SIZE_MAX = float(os.getenv("ETHSOL_BET_SIZE_MAX", "10"))
+# Mise FIXE unique (5 ou 10, pas de variation)
+BET_SIZE = float(os.getenv("ETHSOL_BET_SIZE", "5"))
 
 # Circuit breaker
 MAX_CONSECUTIVE_LOSSES = int(os.getenv("ETHSOL_MAX_CONSECUTIVE_LOSSES", "3"))
@@ -233,10 +232,7 @@ def get_market(market, window_ts):
 # ============================================================
 
 def calculate_bet_size(price):
-    if price <= 0.58:
-        return BET_SIZE_MIN   # 5 USDC
-    else:
-        return BET_SIZE_MAX   # 10 USDC
+    return BET_SIZE   # mise fixe unique, pas de variation
 
 # ============================================================
 # ORDRES POLYMARKET
@@ -247,11 +243,14 @@ async def sell_order_async(token_id, shares, reason, price):
         from polymarket import AsyncSecureClient
         # Arrondi conservateur pour eviter l'erreur "not enough balance"
         shares_safe = max(0.01, round(shares - 0.01, 2))
+        # CORRECTION : vente agressive 0.04 SOUS le prix affiche
+        # pour maximiser la chance d'execution immediate
+        sell_px = max(0.01, round(price - 0.04, 4))
         async with await AsyncSecureClient.create(
                 private_key=PRIVATE_KEY, wallet=WALLET) as client:
             response = await client.place_limit_order(
                 token_id=token_id, side="SELL",
-                price=str(round(price, 4)), size=str(shares_safe))
+                price=str(sell_px), size=str(shares_safe))
             if response.ok:
                 log.info("VENTE " + reason + " @ " + str(round(price, 2)))
                 return True
@@ -268,36 +267,78 @@ async def place_order_async(token_id, outcome, price,
                              bet_size, crypto_entry, market):
     try:
         from polymarket import AsyncSecureClient
-        shares = math.floor(bet_size / price * 100) / 100
+        # Achat agressif : +0.02 au-dessus du prix affiche pour
+        # maximiser l'execution immediate. entry enregistre = prix paye.
+        buy_px = min(0.99, round(price + 0.02, 4))
+        shares = math.floor(bet_size / buy_px * 100) / 100
         async with await AsyncSecureClient.create(
                 private_key=PRIVATE_KEY, wallet=WALLET) as client:
             response = await client.place_limit_order(
                 token_id=token_id, side="BUY",
-                price=str(round(price, 4)), size=str(shares))
-            if response.ok:
-                log.info("[" + market + "] TRADE " + outcome
-                         + " " + str(bet_size) + " USDC @ "
-                         + str(round(price, 2))
-                         + " | " + market + ": " + str(round(crypto_entry, 2)))
-                with positions_lock:
-                    state[market]["open_positions"].append({
-                        "token_id":      token_id,
-                        "entry_price":   price,
-                        "shares":        shares,
-                        "size":          bet_size,
-                        "outcome":       outcome,
-                        "crypto_entry":  crypto_entry,
-                        "side":          outcome,
-                        "peak_price":    price,
-                        "window_ts":     (int(time.time())
-                                          - int(time.time()) % WINDOW_SIZE),
-                        "zero_count":    0,
-                        "market":        market,
-                    })
-                return True
-            log.error("[" + market + "] Erreur ordre: "
-                      + str(response.code) + " " + str(response.message))
-            return False
+                price=str(buy_px), size=str(shares))
+            if not response.ok:
+                log.error("[" + market + "] Erreur ordre: "
+                          + str(response.code) + " " + str(response.message))
+                return False
+
+            order_id = getattr(response, "order_id", None) \
+                or getattr(response, "id", None)
+
+            # VERIFICATION D'EXECUTION : attendre 12s puis verifier
+            await asyncio.sleep(12)
+            executed = True
+            try:
+                open_orders = None
+                for meth in ("get_orders", "get_open_orders"):
+                    fn = getattr(client, meth, None)
+                    if fn:
+                        open_orders = await fn()
+                        break
+                if open_orders is not None and order_id:
+                    ids = []
+                    items = getattr(open_orders, "orders", open_orders)
+                    if isinstance(items, list):
+                        for o in items:
+                            oid = o.get("id") if isinstance(o, dict) \
+                                else getattr(o, "id", None)
+                            ids.append(oid)
+                    if order_id in ids:
+                        executed = False
+                        try:
+                            cancel = getattr(client, "cancel_order", None)
+                            if cancel:
+                                await cancel(order_id=order_id)
+                                log.warning("[" + market + "] ACHAT NON EXECUTE"
+                                            + " - annule, pas de position")
+                        except Exception as ce:
+                            log.warning("[" + market + "] Annulation: " + str(ce))
+            except Exception as ve:
+                log.warning("[" + market + "] Verif achat impossible ("
+                            + str(ve) + ") - position supposee executee")
+
+            if not executed:
+                return False
+
+            log.info("[" + market + "] TRADE " + outcome
+                     + " " + str(bet_size) + " USDC @ "
+                     + str(buy_px)
+                     + " | " + market + ": " + str(round(crypto_entry, 2)))
+            with positions_lock:
+                state[market]["open_positions"].append({
+                    "token_id":      token_id,
+                    "entry_price":   buy_px,
+                    "shares":        shares,
+                    "size":          bet_size,
+                    "outcome":       outcome,
+                    "crypto_entry":  crypto_entry,
+                    "side":          outcome,
+                    "peak_price":    buy_px,
+                    "window_ts":     (int(time.time())
+                                      - int(time.time()) % WINDOW_SIZE),
+                    "zero_count":    0,
+                    "market":        market,
+                })
+            return True
     except Exception as e:
         log.error("[" + market + "] Exception ordre: " + str(e))
         return False
@@ -350,6 +391,16 @@ def monitor_loop():
                     if current <= 0:
                         pos["zero_count"] = pos.get("zero_count", 0) + 1
                         if pos["zero_count"] >= 3:
+                            # CORRECTION CRITIQUE : marche expire sans vente
+                            # = PERTE TOTALE comptee dans le PnL
+                            pnl = (0 - entry) * shares
+                            s["daily_pnl"] += pnl
+                            save_daily_pnl(market, s["daily_pnl"])
+                            record_loss(market)
+                            log.warning("[" + market + "] EXPIRATION SANS VENTE"
+                                        + " - PERTE TOTALE " + str(round(pnl, 2))
+                                        + " | Total: "
+                                        + str(round(s["daily_pnl"], 2)))
                             to_remove.append((market, pos))
                         continue
                     pos["zero_count"] = 0
@@ -365,7 +416,7 @@ def monitor_loop():
 
                     # 1. Marché expiré en perte
                     if current <= 0.02:
-                        pnl = (current - entry) * shares
+                        pnl = (max(0.01, current - 0.04) - entry) * shares
                         s["daily_pnl"] += pnl
                         save_daily_pnl(market, s["daily_pnl"])
                         record_loss(market)
@@ -375,7 +426,7 @@ def monitor_loop():
 
                     # 2. Marché expiré en gain
                     elif current >= 0.98:
-                        pnl = (current - entry) * shares
+                        pnl = (max(0.01, current - 0.04) - entry) * shares
                         s["daily_pnl"] += pnl
                         save_daily_pnl(market, s["daily_pnl"])
                         s["consecutive_losses"] = 0
@@ -387,7 +438,7 @@ def monitor_loop():
                     # 3. Take profit
                     elif current >= TAKE_PROFIT_PRICE:
                         if sell_order(token_id, shares, "TP", current):
-                            pnl = (current - entry) * shares
+                            pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
                             s["consecutive_losses"] = 0
@@ -400,7 +451,7 @@ def monitor_loop():
                     # 4. Stop loss prix
                     elif current <= STOP_LOSS_PRICE:
                         if sell_order(token_id, shares, "SL", current):
-                            pnl = (current - entry) * shares
+                            pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
                             record_loss(market)
@@ -409,7 +460,7 @@ def monitor_loop():
                     # 5. Sortie retournement
                     elif peak - current >= EXIT_REVERSAL and current > entry:
                         if sell_order(token_id, shares, "REVERSAL", current):
-                            pnl = (current - entry) * shares
+                            pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
                             if pnl < 0:
@@ -425,7 +476,7 @@ def monitor_loop():
                           and (int(time.time()) - pos["window_ts"]) >= FORCE_EXIT_SEC
                           and current < entry):
                         if sell_order(token_id, shares, "FORCE_FIN", current):
-                            pnl = (current - entry) * shares
+                            pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
                             record_loss(market)
@@ -444,7 +495,7 @@ def monitor_loop():
                             triggered = True
                         if triggered:
                             if sell_order(token_id, shares, "SL_CRYPTO", current):
-                                pnl = (current - entry) * shares
+                                pnl = (max(0.01, current - 0.04) - entry) * shares
                                 s["daily_pnl"] += pnl
                                 save_daily_pnl(market, s["daily_pnl"])
                                 record_loss(market)
@@ -534,7 +585,7 @@ def run():
                 if (window_ts not in s["traded_windows"]
                         and window_ts in s["strikes"]
                         and seconds_in_window <= ENTRY_WINDOW_MAX
-                        and open_val(market) < MAX_OPEN_USDC):
+                        and len(s["open_positions"]) == 0):
 
                     strike      = s["strikes"][window_ts]
                     price_now   = get_price(market)
