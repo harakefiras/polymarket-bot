@@ -19,7 +19,7 @@ DAILY_TAKE_PROFIT= float(os.getenv("DAILY_TAKE_PROFIT","60"))
 MAX_OPEN_USDC    = float(os.getenv("MAX_OPEN_USDC",    "15"))
 
 # Seuils de sortie par position
-STOP_LOSS_PRICE  = float(os.getenv("STOP_LOSS_PRICE",  "0.30"))
+STOP_LOSS_PRICE  = float(os.getenv("STOP_LOSS_PRICE",  "0.20"))
 TAKE_PROFIT_PRICE= float(os.getenv("TAKE_PROFIT_PRICE","0.85"))
 EXIT_REVERSAL    = float(os.getenv("EXIT_REVERSAL",    "0.10"))
 BTC_DEVIATION    = float(os.getenv("BTC_DEVIATION",    "150"))
@@ -454,18 +454,6 @@ def monitor_loop():
                              + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
 
-                # 3. Take profit
-                elif current >= TAKE_PROFIT_PRICE:
-                    log.info("TAKE PROFIT! @ " + str(round(current, 3)))
-                    if sell_order(token_id, shares, "TP", current):
-                        pnl = (max(0.01, current - 0.04) - entry) * shares
-                        daily_pnl += pnl
-                        save_daily_pnl(daily_pnl)
-                        consecutive_losses = 0   # BUG CORRIGE
-                        log.info("PnL TP: +" + str(round(pnl, 2))
-                                 + " | Total: " + str(round(daily_pnl, 2)))
-                        to_remove.append(pos)
-
                 # 4. Stop loss prix
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 3)))
@@ -476,54 +464,26 @@ def monitor_loop():
                         record_loss()
                         to_remove.append(pos)
 
-                # 5. Sortie retournement (pic atteint, puis recul de EXIT_REVERSAL)
-                elif peak - current >= EXIT_REVERSAL and current > entry:
-                    log.info("SORTIE RETOURNEMENT!")
-                    if sell_order(token_id, shares, "REVERSAL", current):
-                        pnl = (max(0.01, current - 0.04) - entry) * shares
-                        daily_pnl += pnl
-                        save_daily_pnl(daily_pnl)
-                        if pnl < 0:
-                            record_loss()
-                        else:
-                            consecutive_losses = 0   # BUG CORRIGE
-                        log.info("PnL: " + str(round(pnl, 2))
-                                 + " | Total: " + str(round(daily_pnl, 2)))
-                        to_remove.append(pos)
-
-                # 6. Vente forcee derniere minute (a 4min, si encore perdant)
+                # 6. Derniere minute : si en perte ET tendance BTC contre nous -> vente
                 elif (pos.get("window_ts", 0) > 0
                       and (int(time.time()) - pos["window_ts"]) >= 240
                       and current < entry):
-                    log.info("VENTE FORCEE DERNIERE MINUTE @ "
-                             + str(round(current, 3)))
-                    if sell_order(token_id, shares, "FORCE_FIN", current):
-                        pnl = (max(0.01, current - 0.04) - entry) * shares
-                        daily_pnl += pnl
-                        save_daily_pnl(daily_pnl)
-                        record_loss()
-                        log.info("PnL: " + str(round(pnl, 2))
-                                 + " | Total: " + str(round(daily_pnl, 2)))
-                        to_remove.append(pos)
-
-                # 7. Stop loss BTC (le BTC se retourne contre la position)
-                elif pos.get("btc_entry", 0) > 0 and btc_current > 0:
-                    btc_entry = pos["btc_entry"]
-                    if side == "Up" and btc_current < btc_entry - BTC_DEVIATION:
-                        log.info("SL BTC retournement baisse")
-                        if sell_order(token_id, shares, "SL_BTC", current):
+                    tendance_contre = False
+                    if btc_current > 0 and pos.get("btc_entry", 0) > 0:
+                        if side == "Up" and btc_current < pos["btc_entry"]:
+                            tendance_contre = True
+                        elif side == "Down" and btc_current > pos["btc_entry"]:
+                            tendance_contre = True
+                    if tendance_contre:
+                        log.info("VENTE FORCEE derniere minute (tendance contre) @ "
+                                 + str(round(current, 3)))
+                        if sell_order(token_id, shares, "FORCE_FIN", current):
                             pnl = (max(0.01, current - 0.04) - entry) * shares
                             daily_pnl += pnl
                             save_daily_pnl(daily_pnl)
                             record_loss()
-                            to_remove.append(pos)
-                    elif side == "Down" and btc_current > btc_entry + BTC_DEVIATION:
-                        log.info("SL BTC retournement hausse")
-                        if sell_order(token_id, shares, "SL_BTC", current):
-                            pnl = (max(0.01, current - 0.04) - entry) * shares
-                            daily_pnl += pnl
-                            save_daily_pnl(daily_pnl)
-                            record_loss()
+                            log.info("PnL: " + str(round(pnl, 2))
+                                     + " | Total: " + str(round(daily_pnl, 2)))
                             to_remove.append(pos)
 
             # Nettoyage des positions soldees
