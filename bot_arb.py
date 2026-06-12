@@ -296,6 +296,98 @@ def settle_loop():
             log.error("Erreur reglement: " + str(e))
         time.sleep(10)
 
+
+# ============================================================
+# SCANNER GLOBAL : tous les marches actifs (sport, CdM, etc.)
+# Les marches peu surveilles gardent parfois Yes+No < 1 longtemps
+# ============================================================
+
+GLOBAL_SCAN_INTERVAL = int(os.getenv("ARB_GLOBAL_SCAN_INTERVAL", "60"))
+GLOBAL_MIN_DAYS_LEFT = 0      # marches qui se resolvent bientot acceptes
+GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))  # max 7 jours de blocage capital
+
+def scan_global_markets():
+    """Scanne les marches actifs tries par volume, cherche Yes+No < seuil."""
+    found = []
+    try:
+        r = SESSION.get(GAMMA_API + "/markets",
+                        params={"active": "true", "closed": "false",
+                                "limit": 100, "order": "volume24hr",
+                                "ascending": "false"}, timeout=15)
+        if not r.ok:
+            return found
+        for m in r.json():
+            try:
+                outcomes  = json.loads(m.get("outcomes", "[]")) \
+                    if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
+                token_ids = json.loads(m.get("clobTokenIds", "[]")) \
+                    if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+                if len(outcomes) != 2 or len(token_ids) != 2:
+                    continue
+                # date de fin : eviter de bloquer le capital trop longtemps
+                end = m.get("endDate") or m.get("end_date_iso")
+                if end:
+                    try:
+                        end_ts = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp()
+                        days_left = (end_ts - time.time()) / 86400
+                        if days_left > GLOBAL_MAX_DAYS_LEFT or days_left < 0:
+                            continue
+                    except:
+                        pass
+                a0, d0 = get_best_ask(token_ids[0])
+                a1, d1 = get_best_ask(token_ids[1])
+                if a0 is None or a1 is None:
+                    continue
+                total = a0 + a1
+                if total <= SUM_MAX:
+                    found.append({
+                        "question": m.get("question", "?")[:60],
+                        "t0": token_ids[0], "p0": a0, "d0": d0,
+                        "t1": token_ids[1], "p1": a1, "d1": d1,
+                        "total": total,
+                    })
+            except Exception:
+                continue
+    except Exception as e:
+        log.error("Scan global: " + str(e))
+    return found
+
+def global_scan_loop():
+    log.info("Scanner global demarre (sport/CdM/tous marches) - toutes les "
+             + str(GLOBAL_SCAN_INTERVAL) + "s")
+    global daily_pnl
+    while True:
+        try:
+            if daily_pnl > -STOP_LOSS_USDC:
+                opps = scan_global_markets()
+                for o in opps:
+                    log.info("[GLOBAL] OPPORTUNITE | " + o["question"]
+                             + " | somme " + str(round(o["total"], 3))
+                             + " | profondeur " + str(round(min(o["d0"], o["d1"]), 1)))
+                    with arbs_lock:
+                        n = len(open_arbs)
+                    if n >= MAX_CONCURRENT:
+                        continue
+                    shares_cap   = math.floor(TRADE_USDC / o["total"] * 100) / 100
+                    shares_depth = math.floor(min(o["d0"], o["d1"]) * 100) / 100
+                    shares       = min(shares_cap, shares_depth)
+                    if shares < 1:
+                        continue
+                    ok, cout = execute_arb(o["t0"], o["p0"], o["t1"], o["p1"],
+                                            shares, "GLOBAL", 0)
+                    if ok:
+                        with arbs_lock:
+                            open_arbs.append({
+                                "market":   "GLOBAL",
+                                "sum_paid": round(o["p0"] + o["p1"] + 0.02, 4),
+                                "shares":   shares,
+                                # regle a la resolution : on garde 7 jours max en memoire
+                                "expiry":   int(time.time()) + 7 * 86400,
+                            })
+        except Exception as e:
+            log.error("Erreur scan global: " + str(e))
+        time.sleep(GLOBAL_SCAN_INTERVAL)
+
 # ============================================================
 # BOUCLE PRINCIPALE
 # ============================================================
@@ -320,6 +412,8 @@ def run():
 
     settle_thread = threading.Thread(target=settle_loop, daemon=True)
     settle_thread.start()
+    global_thread = threading.Thread(target=global_scan_loop, daemon=True)
+    global_thread.start()
 
     # cache des tokens par fenetre pour eviter les requetes repetees
     token_cache = {}
