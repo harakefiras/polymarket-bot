@@ -19,7 +19,7 @@ DAILY_TAKE_PROFIT = float(os.getenv("ETHSOL_DAILY_TAKE_PROFIT", "60"))
 MAX_OPEN_USDC     = float(os.getenv("ETHSOL_MAX_OPEN_USDC",     "20"))
 
 # Seuils de sortie par position
-STOP_LOSS_PRICE   = float(os.getenv("ETHSOL_STOP_LOSS_PRICE",   "0.30"))
+STOP_LOSS_PRICE   = float(os.getenv("ETHSOL_STOP_LOSS_PRICE",   "0.20"))
 TAKE_PROFIT_PRICE = float(os.getenv("ETHSOL_TAKE_PROFIT_PRICE", "0.85"))
 EXIT_REVERSAL     = float(os.getenv("ETHSOL_EXIT_REVERSAL",     "0.10"))
 
@@ -36,7 +36,7 @@ CIRCUIT_BREAKER_PAUSE  = int(os.getenv("ETHSOL_CIRCUIT_BREAKER_PAUSE",  "7200"))
 # Fenêtre 15 minutes
 WINDOW_SIZE      = 900   # secondes
 ENTRY_WINDOW_MAX = 180   # 3 premières minutes pour entrer
-FORCE_EXIT_SEC   = 780   # vente forcée à 13 minutes si perdant
+FORCE_EXIT_SEC   = 720   # surveillance forcee : 3 dernieres minutes
 
 # Plage horaire 7h-22h UTC
 ACTIVE_HOURS = list(range(7, 22))
@@ -469,19 +469,6 @@ def monitor_loop():
                                  + " | Total: " + str(round(s["daily_pnl"], 2)))
                         to_remove.append((market, pos))
 
-                    # 3. Take profit
-                    elif current >= TAKE_PROFIT_PRICE:
-                        if sell_order(token_id, shares, "TP", current):
-                            pnl = (max(0.01, current - 0.04) - entry) * shares
-                            s["daily_pnl"] += pnl
-                            save_daily_pnl(market, s["daily_pnl"])
-                            s["consecutive_losses"] = 0
-                            log.info("[" + market + "] TP +"
-                                     + str(round(pnl, 2))
-                                     + " | Total: "
-                                     + str(round(s["daily_pnl"], 2)))
-                            to_remove.append((market, pos))
-
                     # 4. Stop loss prix
                     elif current <= STOP_LOSS_PRICE:
                         if sell_order(token_id, shares, "SL", current):
@@ -491,48 +478,26 @@ def monitor_loop():
                             record_loss(market)
                             to_remove.append((market, pos))
 
-                    # 5. Sortie retournement
-                    elif peak - current >= EXIT_REVERSAL and current > entry:
-                        if sell_order(token_id, shares, "REVERSAL", current):
-                            pnl = (max(0.01, current - 0.04) - entry) * shares
-                            s["daily_pnl"] += pnl
-                            save_daily_pnl(market, s["daily_pnl"])
-                            if pnl < 0:
-                                record_loss(market)
-                            else:
-                                s["consecutive_losses"] = 0
-                            log.info("[" + market + "] REVERSAL "
-                                     + str(round(pnl, 2)))
-                            to_remove.append((market, pos))
-
-                    # 6. Vente forcée à 13 minutes si perdant
+                    # 6. 3 dernieres minutes : si en perte ET tendance crypto contre -> vente
                     elif (pos.get("window_ts", 0) > 0
                           and (int(time.time()) - pos["window_ts"]) >= FORCE_EXIT_SEC
                           and current < entry):
-                        if sell_order(token_id, shares, "FORCE_FIN", current):
-                            pnl = (max(0.01, current - 0.04) - entry) * shares
-                            s["daily_pnl"] += pnl
-                            save_daily_pnl(market, s["daily_pnl"])
-                            record_loss(market)
-                            log.info("[" + market + "] FORCE_FIN "
-                                     + str(round(pnl, 2)))
-                            to_remove.append((market, pos))
-
-                    # 7. Stop loss crypto (retournement fort)
-                    elif pos.get("crypto_entry", 0) > 0 and crypto_current > 0:
-                        deviation  = MARKETS[market]["deviation"]
-                        c_entry    = pos["crypto_entry"]
-                        triggered  = False
-                        if side == "Up" and crypto_current < c_entry - deviation:
-                            triggered = True
-                        elif side == "Down" and crypto_current > c_entry + deviation:
-                            triggered = True
-                        if triggered:
-                            if sell_order(token_id, shares, "SL_CRYPTO", current):
+                        tendance_contre = False
+                        if crypto_current > 0 and pos.get("crypto_entry", 0) > 0:
+                            if side == "Up" and crypto_current < pos["crypto_entry"]:
+                                tendance_contre = True
+                            elif side == "Down" and crypto_current > pos["crypto_entry"]:
+                                tendance_contre = True
+                        if tendance_contre:
+                            log.info("[" + market + "] VENTE FORCEE fin de fenetre"
+                                     + " (tendance contre) @ " + str(round(current, 3)))
+                            if sell_order(token_id, shares, "FORCE_FIN", current):
                                 pnl = (max(0.01, current - 0.04) - entry) * shares
                                 s["daily_pnl"] += pnl
                                 save_daily_pnl(market, s["daily_pnl"])
                                 record_loss(market)
+                                log.info("[" + market + "] FORCE_FIN "
+                                         + str(round(pnl, 2)))
                                 to_remove.append((market, pos))
 
                 # Nettoyage des positions soldées
