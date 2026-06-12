@@ -247,7 +247,11 @@ def get_btc_market(window_ts):
 # ============================================================
 
 def calculate_bet_size(price):
-    return BET_SIZE   # mise fixe unique, pas de variation
+    # Paliers RONDS uniquement : jamais de virgule
+    if price <= 0.58:
+        return 5.0    # token proche de 50% -> mise 5$
+    else:
+        return 10.0   # token au-dela de 58% -> momentum -> mise 10$
 
 # ============================================================
 # ORDRES POLYMARKET
