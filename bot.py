@@ -19,8 +19,8 @@ DAILY_TAKE_PROFIT= float(os.getenv("DAILY_TAKE_PROFIT","60"))
 MAX_OPEN_USDC    = float(os.getenv("MAX_OPEN_USDC",    "15"))
 
 # Seuils de sortie par position
-STOP_LOSS_PRICE  = float(os.getenv("STOP_LOSS_PRICE",  "0.20"))
-TAKE_PROFIT_PRICE= float(os.getenv("TAKE_PROFIT_PRICE","0.85"))
+STOP_LOSS_PRICE  = float(os.getenv("STOP_LOSS_PRICE",  "0.30"))
+TAKE_PROFIT_GAIN = float(os.getenv("TAKE_PROFIT_GAIN","0.40"))
 EXIT_REVERSAL    = float(os.getenv("EXIT_REVERSAL",    "0.10"))
 BTC_DEVIATION    = float(os.getenv("BTC_DEVIATION",    "150"))
 
@@ -43,7 +43,7 @@ GAP_MIN          = float(os.getenv("GAP_MIN",          "50"))
 # Acheter a 0.75 = gain max limité, perte max totale → mauvais rapport
 # Entre 0.52 et 0.65, le rapport risque/gain est plus equilibre
 ENTRY_PRICE_MIN  = float(os.getenv("ENTRY_PRICE_MIN",  "0.52"))
-ENTRY_PRICE_MAX  = float(os.getenv("ENTRY_PRICE_MAX",  "0.65"))
+ENTRY_PRICE_MAX  = float(os.getenv("ENTRY_PRICE_MAX",  "0.68"))
 
 # Entree uniquement dans la 1ere minute (60s) -- garde
 ENTRY_WINDOW_MAX = int(os.getenv("ENTRY_WINDOW_MAX",   "60"))
@@ -247,11 +247,10 @@ def get_btc_market(window_ts):
 # ============================================================
 
 def calculate_bet_size(price):
-    # Paliers RONDS uniquement : jamais de virgule
-    if price <= 0.58:
-        return 5.0    # token proche de 50% -> mise 5$
+    if price <= 0.63:
+        return 5.0
     else:
-        return 10.0   # token au-dela de 58% -> momentum -> mise 10$
+        return 10.0
 
 # ============================================================
 # ORDRES POLYMARKET
@@ -454,7 +453,19 @@ def monitor_loop():
                              + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
 
-                # 4. Stop loss prix
+                # 3. TAKE PROFIT : +40% de gain par rapport a l'entree
+                elif current >= entry * (1 + TAKE_PROFIT_GAIN):
+                    log.info("TAKE PROFIT +40%! @ " + str(round(current, 3)))
+                    if sell_order(token_id, shares, "TP", current):
+                        pnl = (max(0.01, current - 0.04) - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        consecutive_losses = 0
+                        log.info("PnL TP: +" + str(round(pnl, 2))
+                                 + " | Total: " + str(round(daily_pnl, 2)))
+                        to_remove.append(pos)
+
+                # 4. Stop loss prix (0.30)
                 elif current <= STOP_LOSS_PRICE:
                     log.info("STOP LOSS! @ " + str(round(current, 3)))
                     if sell_order(token_id, shares, "SL", current):
@@ -464,27 +475,20 @@ def monitor_loop():
                         record_loss()
                         to_remove.append(pos)
 
-                # 6. Derniere minute : si en perte ET tendance BTC contre nous -> vente
+                # 6. DERNIERE MINUTE (240s) : si en perte -> vente forcee SYSTEMATIQUE
                 elif (pos.get("window_ts", 0) > 0
                       and (int(time.time()) - pos["window_ts"]) >= 240
                       and current < entry):
-                    tendance_contre = False
-                    if btc_current > 0 and pos.get("btc_entry", 0) > 0:
-                        if side == "Up" and btc_current < pos["btc_entry"]:
-                            tendance_contre = True
-                        elif side == "Down" and btc_current > pos["btc_entry"]:
-                            tendance_contre = True
-                    if tendance_contre:
-                        log.info("VENTE FORCEE derniere minute (tendance contre) @ "
-                                 + str(round(current, 3)))
-                        if sell_order(token_id, shares, "FORCE_FIN", current):
-                            pnl = (max(0.01, current - 0.04) - entry) * shares
-                            daily_pnl += pnl
-                            save_daily_pnl(daily_pnl)
-                            record_loss()
-                            log.info("PnL: " + str(round(pnl, 2))
-                                     + " | Total: " + str(round(daily_pnl, 2)))
-                            to_remove.append(pos)
+                    log.info("VENTE FORCEE derniere minute (en perte) @ "
+                             + str(round(current, 3)))
+                    if sell_order(token_id, shares, "FORCE_FIN", current):
+                        pnl = (max(0.01, current - 0.04) - entry) * shares
+                        daily_pnl += pnl
+                        save_daily_pnl(daily_pnl)
+                        record_loss()
+                        log.info("PnL: " + str(round(pnl, 2))
+                                 + " | Total: " + str(round(daily_pnl, 2)))
+                        to_remove.append(pos)
 
             # Nettoyage des positions soldees
             if to_remove:
