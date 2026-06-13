@@ -38,6 +38,8 @@ CIRCUIT_BREAKER_PAUSE  = int(os.getenv("CIRCUIT_BREAKER_PAUSE",  "7200"))
 # Gap reduit a 50$ (au lieu de 30$) : 30$ c'est du bruit sur BTC,
 # 50$ donne un signal plus fiable sur 5 minutes
 GAP_MIN          = float(os.getenv("GAP_MIN",          "50"))
+# Gap dynamique : % du prix BTC, recalcule a chaque fenetre (0 = desactive, utilise GAP_MIN fixe)
+GAP_PCT          = float(os.getenv("GAP_PCT",          "0.08"))
 
 # Fourchette d'entree resserree : on plafonne a 0.65 (au lieu de 0.75)
 # Acheter a 0.75 = gain max limité, perte max totale → mauvais rapport
@@ -590,8 +592,10 @@ def run():
                 strike  = strikes[window_ts]
                 btc_now = get_btc_price()
                 gap     = btc_now - strike
+                # Gap dynamique : 0.08% du prix actuel (fallback GAP_MIN si GAP_PCT=0)
+                gap_seuil = (btc_now * GAP_PCT / 100) if GAP_PCT > 0 else GAP_MIN
 
-                if abs(gap) >= GAP_MIN:
+                if abs(gap) >= gap_seuil:
                     target_outcome = "Up" if gap > 0 else "Down"
                     log.info("Gap " + str(round(gap, 1)) + "$ | "
                              + target_outcome + " | BTC: "
@@ -632,6 +636,7 @@ def run():
                                          + ") - skip")
                 else:
                     log.info("Gap insuffisant (" + str(round(abs(gap), 1))
+                             + "$ < " + str(round(gap_seuil, 1))
                              + "$) - attente signal")
 
             # Nettoyage memoire strikes (50 dernieres fenetres max)
