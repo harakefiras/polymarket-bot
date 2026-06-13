@@ -47,6 +47,7 @@ MARKETS = {
         "slug":     "eth-updown-15m-",
         "coinbase": "https://api.coinbase.com/v2/prices/ETH-USD/spot",
         "gap":      float(os.getenv("ETH_GAP_MIN", "8")),
+        "gap_pct":  float(os.getenv("ETH_GAP_PCT", "0.12")),
         "deviation": float(os.getenv("ETH_DEVIATION", "50")),
         "entry_min": float(os.getenv("ETH_ENTRY_PRICE_MIN", "0.52")),
         "entry_max": float(os.getenv("ETH_ENTRY_PRICE_MAX", "0.68")),
@@ -55,6 +56,7 @@ MARKETS = {
         "slug":     "sol-updown-15m-",
         "coinbase": "https://api.coinbase.com/v2/prices/SOL-USD/spot",
         "gap":      float(os.getenv("SOL_GAP_MIN", "3")),
+        "gap_pct":  float(os.getenv("SOL_GAP_PCT", "0.12")),
         "deviation": float(os.getenv("SOL_DEVIATION", "10")),
         "entry_min": float(os.getenv("SOL_ENTRY_PRICE_MIN", "0.52")),
         "entry_max": float(os.getenv("SOL_ENTRY_PRICE_MAX", "0.68")),
@@ -595,7 +597,9 @@ def run():
                     price_now   = get_price(market)
                     gap         = price_now - strike
 
-                    if abs(gap) >= cfg["gap"]:
+                    gap_pct   = cfg.get("gap_pct", 0)
+                    gap_seuil = (price_now * gap_pct / 100) if gap_pct > 0 else cfg["gap"]
+                    if abs(gap) >= gap_seuil:
                         target_outcome = "Up" if gap > 0 else "Down"
                         log.info("[" + market + "] Gap "
                                  + str(round(gap, 2)) + "$ | "
@@ -639,7 +643,8 @@ def run():
                                              + str(round(token_price, 3)) + ") - skip")
                     else:
                         log.info("[" + market + "] Gap insuffisant ("
-                                 + str(round(abs(gap), 2)) + "$)")
+                                 + str(round(abs(gap), 2)) + "$ < "
+                                 + str(round(gap_seuil, 2)) + "$)")
 
                 # Nettoyage mémoire strikes
                 if len(s["strikes"]) > 50:
