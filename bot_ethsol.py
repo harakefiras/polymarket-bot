@@ -337,7 +337,8 @@ def run():
     global daily_pnl, pnl_date, traded_windows, consecutive_losses
     load_strikes()
     log.info("Bot ETH+SOL 15min v2 - TP+30% | SL-10% | Trailing")
-    log.info("Gap: " + str(GAP_MIN) + "$ | Entrée: " + str(ENTRY_PRICE_MIN) + "-" + str(ENTRY_PRICE_MAX))
+    for m, cfg in MARKETS.items():
+        log.info("[" + m + "] Gap: " + str(cfg["gap_min"]) + "$ | GAP_PCT: " + str(cfg["gap_pct"]) + "% | Entrée: " + str(cfg["entry_min"]) + "-" + str(cfg["entry_max"]))
 
     if not PRIVATE_KEY.startswith("0x"):
         log.error("PRIVATE_KEY manquante!")
@@ -434,3 +435,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+.
