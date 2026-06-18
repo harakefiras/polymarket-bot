@@ -335,20 +335,7 @@ def monitor_loop():
                         log.info("PnL SL: " + str(round(pnl, 2)) + "$ | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
 
-                # 5. TRAILING : prix redescend du pic
-                elif current < peak and peak > entry:
-                    log.info("TRAILING STOP! Pic: " + str(round(peak, 3))
-                             + " -> " + str(round(current, 3)))
-                    if sell_order(token_id, shares, "TRAIL", current):
-                        pnl = (max(0.01, current - 0.04) - entry) * shares
-                        daily_pnl += pnl
-                        save_daily_pnl(daily_pnl)
-                        if pnl > 0:
-                            consecutive_losses = 0
-                        else:
-                            record_loss()
-                        log.info("PnL TRAIL: " + str(round(pnl, 2)) + "$ | Total: " + str(round(daily_pnl, 2)))
-                        to_remove.append(pos)
+                # Trailing désactivé — TP+30% et SL-10% uniquement
 
             if to_remove:
                 with positions_lock:
