@@ -333,6 +333,51 @@ def monitor_loop():
             log.error("Erreur monitor: " + str(e))
         time.sleep(MONITOR_INTERVAL)
 
+MARKETS = {
+    "ETH": {
+        "coinbase":  "https://api.coinbase.com/v2/prices/ETH-USD/spot",
+        "slug":      "eth-updown-15m-",
+        "gap_min":   float(os.getenv("ETH_GAP_MIN", "3")),
+        "gap_pct":   float(os.getenv("ETH_GAP_PCT", "0")),
+        "entry_min": float(os.getenv("ETH_ENTRY_PRICE_MIN", "0.52")),
+        "entry_max": float(os.getenv("ETH_ENTRY_PRICE_MAX", "0.80")),
+    },
+    "SOL": {
+        "coinbase":  "https://api.coinbase.com/v2/prices/SOL-USD/spot",
+        "slug":      "sol-updown-15m-",
+        "gap_min":   float(os.getenv("SOL_GAP_MIN", "0.5")),
+        "gap_pct":   float(os.getenv("SOL_GAP_PCT", "0")),
+        "entry_min": float(os.getenv("SOL_ENTRY_PRICE_MIN", "0.52")),
+        "entry_max": float(os.getenv("SOL_ENTRY_PRICE_MAX", "0.80")),
+    }
+}
+WINDOW_SIZE = 900
+
+def get_crypto_price(market):
+    try:
+        r = requests.get(MARKETS[market]["coinbase"], timeout=10)
+        if r.ok:
+            return float(r.json()["data"]["amount"])
+        return 0
+    except:
+        return 0
+
+def get_market_tokens(market, window_ts):
+    try:
+        slug = MARKETS[market]["slug"] + str(window_ts)
+        r = requests.get(GAMMA_API + "/markets", params={"slug": slug}, timeout=10)
+        if r.ok:
+            data = r.json()
+            m = data[0] if isinstance(data, list) and len(data) > 0 else None
+            if m and m.get("slug") == slug:
+                outcomes  = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
+                token_ids = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+                m["tokens"] = [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+                return m
+        return None
+    except:
+        return None
+
 def run():
     global daily_pnl, pnl_date, traded_windows, consecutive_losses
     load_strikes()
