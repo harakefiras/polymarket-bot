@@ -15,7 +15,7 @@ from datetime import date, datetime, timezone
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
-SUM_MAX        = float(os.getenv("SPORT_SUM_MAX",        "0.95"))
+SUM_MAX        = float(os.getenv("SPORT_SUM_MAX",        "0.98"))
 TRADE_USDC     = float(os.getenv("SPORT_TRADE_USDC",     "10"))
 MAX_CONCURRENT = int(os.getenv("SPORT_MAX_CONCURRENT",   "5"))
 STOP_LOSS_USDC = float(os.getenv("SPORT_STOP_LOSS_USDC", "20"))
@@ -90,6 +90,14 @@ def get_best_ask(token_id):
     except:
         return None, 0
 
+
+FEE_PER_LEG = float(os.getenv("SPORT_FEE_PER_LEG", "0.01"))
+
+def net_gain_after_fees(p0, p1):
+    """Gain net réel après frais Polymarket sur les deux jambes."""
+    cout = p0 * (1 + FEE_PER_LEG) + p1 * (1 + FEE_PER_LEG)
+    return 1.0 - cout
+
 def is_excluded(question):
     """Retourne True si le marché est lié à crypto (déjà couvert par Bot 3)."""
     q = question.lower()
@@ -102,13 +110,20 @@ def scan_all_markets():
     """
     found = []
     try:
-        # Plusieurs pages pour couvrir plus de marchés
-        for offset in [0, 100, 200]:
+        # Scanne 500 marchés sur plusieurs tris pour maximiser les trouvailles
+        seen_slugs = set()
+        scan_configs = [
+            {"order": "volume24hr",  "ascending": "false"},  # gros volume
+            {"order": "liquidity",   "ascending": "false"},  # forte liquidité
+            {"order": "endDate",     "ascending": "true"},   # expire bientôt
+        ]
+        for cfg in scan_configs:
+          for offset in [0, 100, 200]:
             r = SESSION.get(GAMMA_API + "/markets",
                             params={"active": "true", "closed": "false",
                                     "limit": 100, "offset": offset,
-                                    "order": "volume24hr",
-                                    "ascending": "false"}, timeout=15)
+                                    "order": cfg["order"],
+                                    "ascending": cfg["ascending"]}, timeout=15)
             if not r.ok:
                 continue
             for m in r.json():
@@ -142,10 +157,11 @@ def scan_all_markets():
                         except:
                             pass
 
-                    # Déjà traité aujourd'hui
+                    # Déjà traité aujourd'hui ou déjà vu dans ce scan
                     slug = m.get("slug", "")
-                    if slug in done_markets:
+                    if slug in done_markets or slug in seen_slugs:
                         continue
+                    seen_slugs.add(slug)
 
                     # Lit les deux carnets
                     a0, d0 = get_best_ask(token_ids[0])
@@ -154,7 +170,9 @@ def scan_all_markets():
                         continue
 
                     total = a0 + a1
-                    if total <= SUM_MAX:
+                    net = net_gain_after_fees(a0, a1)
+                    # N'ajoute QUE si gain net positif après frais (évite les -0.03$)
+                    if total <= SUM_MAX and net >= 0.01:
                         found.append({
                             "question": question[:70],
                             "slug":     slug,
@@ -366,7 +384,9 @@ def run():
             opps = scan_all_markets()
 
             if not opps:
-                log.info("Aucune opportunité trouvée")
+                log.info("Aucune opportunité < " + str(SUM_MAX)
+                         + " (marchés sport souvent à ~0.99) | PnL: "
+                         + str(round(daily_pnl, 2)) + "$")
             else:
                 for o in opps:
                     log.info("OPPORTUNITÉ | " + o["question"]
