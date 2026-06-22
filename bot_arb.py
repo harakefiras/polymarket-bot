@@ -10,20 +10,22 @@ from datetime import date, datetime, timezone
 # 4. Comportement fail-safe si solde indisponible (ABANDON)
 # 5. Revente jambe orpheline à px - 0.01 au lieu de px - 0.03
 # 6. Perte jambe orpheline calculée sur slippage réel (0.01 * shares)
+# 7. Log à chaque scan (debug somme en temps réel)
 # ============================================================
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
-SUM_MAX        = float(os.getenv("ARB_SUM_MAX",        "0.96"))
+SUM_MAX        = float(os.getenv("ARB_SUM_MAX",        "0.98"))
 FEE_PER_LEG    = float(os.getenv("ARB_FEE_PER_LEG",   "0.01"))
 MIN_NET_GAIN   = float(os.getenv("ARB_MIN_NET_GAIN",  "0.015"))
-TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC",     "10"))
+TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC",     "20"))
 MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT",   "3"))
 STOP_LOSS_USDC = float(os.getenv("ARB_STOP_LOSS_USDC", "15"))
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL",  "5"))
 MAX_DAYS_LEFT  = float(os.getenv("ARB_MAX_DAYS",       "7"))
 MAX_SLIPPAGE   = float(os.getenv("ARB_MAX_SLIPPAGE",  "0.01"))
+DEBUG_LOGS     = os.getenv("ARB_DEBUG_LOGS", "true").lower() == "true"
 
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
                           int(os.getenv("ARB_HOUR_END",   "24"))))
@@ -49,10 +51,8 @@ except:
 log = logging.getLogger("arb_v4")
 
 # ── LOCK GLOBAL SOLDE ──────────────────────────────────────────────────────────
-# Protège contre la race condition : deux arbs simultanés qui lisent le même
-# solde avant que l'un ait engagé ses fonds.
 balance_lock     = threading.Lock()
-reserved_balance = 0.0  # montant actuellement réservé par des arbs en cours d'exécution
+reserved_balance = 0.0
 
 
 def load_daily_pnl():
@@ -81,10 +81,6 @@ done_windows = set()
 
 
 def get_usdc_balance_clob():
-    """
-    Tente de lire le solde USDC via l'API CLOB Polymarket.
-    Retourne float ou None.
-    """
     try:
         r = SESSION.get(CLOB_API + "/balance-allowance",
                         params={"asset_type": "USDC", "signature_type": "EOA"},
@@ -93,7 +89,6 @@ def get_usdc_balance_clob():
             data = r.json()
             bal = data.get("balance") or data.get("allowance")
             if bal is not None:
-                # Le CLOB retourne le solde en micro-USDC (6 décimales)
                 return float(bal) / 1_000_000
         return None
     except Exception as e:
@@ -101,10 +96,6 @@ def get_usdc_balance_clob():
         return None
 
 def get_usdc_balance_data_api():
-    """
-    Fallback : lit le solde via data-api.
-    Attention : retourne la valeur totale du portefeuille, pas uniquement le cash.
-    """
     try:
         r = SESSION.get("https://data-api.polymarket.com/value",
                         params={"user": WALLET}, timeout=8)
@@ -120,11 +111,6 @@ def get_usdc_balance_data_api():
         return None
 
 def get_usdc_balance():
-    """
-    Essaie d'abord le CLOB (plus fiable, cash uniquement).
-    Si indisponible, tombe en fallback sur data-api.
-    Retourne None si les deux échouent.
-    """
     bal = get_usdc_balance_clob()
     if bal is not None:
         return bal
@@ -142,9 +128,13 @@ def get_market_tokens(slug_prefix, window_ts):
             if m and m.get("slug") == slug:
                 outcomes  = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
                 token_ids = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+                log.info("[" + slug_prefix.rstrip("-") + "] Marché chargé: " + slug
+                         + " | tokens: " + str(token_ids[:2]))
                 return [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
+        log.warning("[" + slug_prefix + "] Marché introuvable: " + slug_prefix + str(window_ts))
         return None
-    except:
+    except Exception as e:
+        log.warning("get_market_tokens: " + str(e))
         return None
 
 def get_best_ask(token_id):
@@ -160,7 +150,6 @@ def get_best_ask(token_id):
         return None, 0
 
 def read_both_asks(up_id, down_id):
-    """Lit les deux carnets en parallèle."""
     res = {}
     def _read(side, tid):
         res[side] = get_best_ask(tid)
@@ -175,14 +164,8 @@ def net_gain_after_fees(up_px, down_px, fee_per_leg):
 
 
 async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, market_key):
-    """
-    Exécute l'arbitrage avec :
-    - Lock sur le solde (anti race-condition)
-    - Réservation du montant pendant l'exécution
-    - Fail-safe si solde indisponible
-    - Revente orpheline à px - 0.01 (slippage minimal)
-    """
     global daily_pnl, reserved_balance
+    cout_total = 0.0
     try:
         from polymarket import AsyncSecureClient
 
@@ -212,17 +195,12 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
             log.warning("[" + market_key + "] Profondeur insuffisante — abandon")
             return False, 0
 
-        cout_total = (up_px + down_px) * shares
-        cout_avec_marge = cout_total * 1.05  # marge 5% pour frais/arrondis
+        cout_total      = (up_px + down_px) * shares
+        cout_avec_marge = cout_total * 1.05
 
         # ── VERIFICATION + RESERVATION DU SOLDE (avec lock) ──────────────────
-        # Le lock garantit qu'un seul arb à la fois vérifie et réserve le solde.
-        # Sans ça, deux arbs simultanés lisent le même solde disponible et
-        # engagent tous les deux leurs fonds.
         with balance_lock:
             solde = get_usdc_balance()
-
-            # Fail-safe : si le solde est indisponible, on n'essaie pas
             if solde is None:
                 log.warning("[" + market_key + "] Solde indisponible — ABANDON par précaution")
                 return False, 0
@@ -234,7 +212,6 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
                             + str(round(cout_avec_marge, 2)) + "$ requis) — ABANDON")
                 return False, 0
 
-            # Réservation immédiate avant de sortir du lock
             reserved_balance += cout_total
             log.info("[" + market_key + "] Solde OK: " + str(round(solde, 2))
                      + "$ | dispo: " + str(round(solde_disponible, 2))
@@ -265,7 +242,6 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
 
                 await asyncio.sleep(6)
 
-                # Vérifie quelles jambes sont réellement remplies
                 filled = {"up": ok_up, "down": ok_down}
                 try:
                     open_orders = None
@@ -291,7 +267,6 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
                 except Exception as ve:
                     log.warning("Vérif jambes: " + str(ve))
 
-                # ── ARB VERROUILLE ─────────────────────────────────────────────
                 if filled["up"] and filled["down"]:
                     gain_net = net_gain_after_fees(up_px, down_px, FEE_PER_LEG) * shares
                     log.info("[" + market_key + "] ✅ ARB VERROUILLÉ | somme "
@@ -299,9 +274,6 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
                              + " | gain net +" + str(round(gain_net, 2)) + "$")
                     return True, cout_total
 
-                # ── JAMBE ORPHELINE : revente à px - 0.01 (slippage minimal) ──
-                # On vend 1 cent sous le prix d'achat, pas 3 cents comme en v3.
-                # La perte réelle est donc ~0.01 * shares au lieu de 0.04 * shares.
                 async def sell(tid, px):
                     try:
                         sp = max(0.01, round(px - 0.01, 4))
@@ -313,33 +285,27 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
                         log.error("Revente: " + str(e))
 
                 if filled["up"] and not filled["down"]:
-                    log.warning("[" + market_key + "] Jambe DOWN manquante — revente UP à " + str(round(up_px - 0.01, 4)))
+                    log.warning("[" + market_key + "] Jambe DOWN manquante — revente UP")
                     await sell(up_id, up_px)
-                    perte = 0.01 * shares  # slippage réel estimé
-                    daily_pnl -= perte
+                    daily_pnl -= 0.01 * shares
                     save_daily_pnl(daily_pnl)
                     return False, 0
 
                 if filled["down"] and not filled["up"]:
-                    log.warning("[" + market_key + "] Jambe UP manquante — revente DOWN à " + str(round(down_px - 0.01, 4)))
+                    log.warning("[" + market_key + "] Jambe UP manquante — revente DOWN")
                     await sell(down_id, down_px)
-                    perte = 0.01 * shares
-                    daily_pnl -= perte
+                    daily_pnl -= 0.01 * shares
                     save_daily_pnl(daily_pnl)
                     return False, 0
 
                 return False, 0
 
         finally:
-            # ── LIBERATION DE LA RESERVATION (toujours exécuté) ───────────────
             with balance_lock:
                 reserved_balance = max(0.0, reserved_balance - cout_total)
 
     except Exception as e:
         log.error("Exception arb: " + str(e))
-        # Libère la réservation en cas d'exception non gérée
-        with balance_lock:
-            reserved_balance = max(0.0, reserved_balance - (cout_total if 'cout_total' in dir() else 0))
         return False, 0
 
 
@@ -378,7 +344,8 @@ def run():
     log.info("Seuil somme: " + str(SUM_MAX) + " | Gain net min: " + str(MIN_NET_GAIN)
              + " | Frais/jambe: " + str(FEE_PER_LEG)
              + " | Trade: " + str(TRADE_USDC) + "$"
-             + " | Max simultanés: " + str(MAX_CONCURRENT))
+             + " | Max simultanés: " + str(MAX_CONCURRENT)
+             + " | Debug: " + str(DEBUG_LOGS))
     log.info("Marchés: " + ", ".join(SHORT_MARKETS.keys())
              + " | PnL: " + str(round(daily_pnl, 2)))
 
@@ -456,13 +423,21 @@ def run():
                 total = up_px + down_px
                 net   = net_gain_after_fees(up_px, down_px, FEE_PER_LEG)
 
-                # Heartbeat par marché (toutes les 5 min)
-                if time.time() - last_heartbeat.get(mkey, 0) >= 300:
-                    log.info("[" + mkey + "] scan | somme " + str(round(total, 3))
+                # ── LOG A CHAQUE SCAN (debug) ──────────────────────────────────
+                if DEBUG_LOGS:
+                    log.info("[" + mkey + "] somme " + str(round(total, 3))
+                             + " | up " + str(round(up_px, 3))
+                             + " | down " + str(round(down_px, 3))
                              + " | net " + str(round(net, 4))
-                             + " | seuil " + str(SUM_MAX)
                              + " | PnL: " + str(round(daily_pnl, 2)) + "$")
-                    last_heartbeat[mkey] = time.time()
+                else:
+                    # Heartbeat toutes les 5 min seulement
+                    if time.time() - last_heartbeat.get(mkey, 0) >= 300:
+                        log.info("[" + mkey + "] scan | somme " + str(round(total, 3))
+                                 + " | net " + str(round(net, 4))
+                                 + " | seuil " + str(SUM_MAX)
+                                 + " | PnL: " + str(round(daily_pnl, 2)) + "$")
+                        last_heartbeat[mkey] = time.time()
 
                 if total <= SUM_MAX and net >= MIN_NET_GAIN:
                     shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
@@ -478,9 +453,6 @@ def run():
                     ok, cout = execute_arb(up["token_id"], up_px,
                                            down["token_id"], down_px, shares, mkey)
 
-                    # ── done_windows seulement si succès ──────────────────────
-                    # En v3, la fenêtre était marquée même en cas d'échec,
-                    # ce qui faisait rater de vraies opportunités.
                     if ok:
                         done_windows.add(cache_key)
                         with arbs_lock:
