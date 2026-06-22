@@ -2,15 +2,14 @@ import os, time, logging, requests, json, asyncio, math, threading
 from datetime import date, datetime, timezone
 
 # ============================================================
-# BOT ARBITRAGE YES+NO v4 - POLYMARKET
-# CORRECTIONS vs v3 :
-# 1. Lock global sur la vérification + réservation du solde (anti race-condition)
-# 2. done_windows ajouté SEULEMENT si l'arb réussit
-# 3. get_usdc_balance() avec fallback CLOB + solde réservé déduit
-# 4. Comportement fail-safe si solde indisponible (ABANDON)
-# 5. Revente jambe orpheline à px - 0.01 au lieu de px - 0.03
-# 6. Perte jambe orpheline calculée sur slippage réel (0.01 * shares)
-# 7. Log à chaque scan (debug somme en temps réel)
+# BOT ARBITRAGE YES+NO v3 - POLYMARKET
+# CORRECTIONS MAJEURES vs v2 :
+# 1. Re-vérification de la somme JUSTE avant l'achat (anti-slippage)
+# 2. Seuil intégrant les frais réels (gain net garanti)
+# 3. Achat des deux jambes au prix EXACT du carnet (pas de +0.01)
+# 4. Marge de sécurité sur le slippage
+# 5. Abandon immédiat si la somme dépasse le seuil au moment d'acheter
+# 6. Fix solde : fail-safe si indisponible, ABANDON si insuffisant
 # ============================================================
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
@@ -19,13 +18,12 @@ WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 SUM_MAX        = float(os.getenv("ARB_SUM_MAX",        "0.98"))
 FEE_PER_LEG    = float(os.getenv("ARB_FEE_PER_LEG",   "0.01"))
 MIN_NET_GAIN   = float(os.getenv("ARB_MIN_NET_GAIN",  "0.015"))
-TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC",     "20"))
+TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC",     "10"))
 MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT",   "3"))
 STOP_LOSS_USDC = float(os.getenv("ARB_STOP_LOSS_USDC", "15"))
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL",  "5"))
 MAX_DAYS_LEFT  = float(os.getenv("ARB_MAX_DAYS",       "7"))
 MAX_SLIPPAGE   = float(os.getenv("ARB_MAX_SLIPPAGE",  "0.01"))
-DEBUG_LOGS     = os.getenv("ARB_DEBUG_LOGS", "true").lower() == "true"
 
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
                           int(os.getenv("ARB_HOUR_END",   "24"))))
@@ -48,12 +46,7 @@ try:
     sys.stdout.reconfigure(line_buffering=True)
 except:
     pass
-log = logging.getLogger("arb_v4")
-
-# ── LOCK GLOBAL SOLDE ──────────────────────────────────────────────────────────
-balance_lock     = threading.Lock()
-reserved_balance = 0.0
-
+log = logging.getLogger("arb_v3")
 
 def load_daily_pnl():
     try:
@@ -80,22 +73,7 @@ arbs_lock    = threading.Lock()
 done_windows = set()
 
 
-def get_usdc_balance_clob():
-    try:
-        r = SESSION.get(CLOB_API + "/balance-allowance",
-                        params={"asset_type": "USDC", "signature_type": "EOA"},
-                        timeout=8)
-        if r.ok:
-            data = r.json()
-            bal = data.get("balance") or data.get("allowance")
-            if bal is not None:
-                return float(bal) / 1_000_000
-        return None
-    except Exception as e:
-        log.warning("Solde CLOB indisponible: " + str(e))
-        return None
-
-def get_usdc_balance_data_api():
+def get_usdc_balance():
     try:
         r = SESSION.get("https://data-api.polymarket.com/value",
                         params={"user": WALLET}, timeout=8)
@@ -107,16 +85,8 @@ def get_usdc_balance_data_api():
                 return float(data.get("value", data.get("balance", 0)))
         return None
     except Exception as e:
-        log.warning("Solde data-api indisponible: " + str(e))
+        log.warning("Solde indisponible: " + str(e))
         return None
-
-def get_usdc_balance():
-    bal = get_usdc_balance_clob()
-    if bal is not None:
-        return bal
-    log.warning("CLOB balance KO, fallback data-api")
-    return get_usdc_balance_data_api()
-
 
 def get_market_tokens(slug_prefix, window_ts):
     try:
@@ -128,13 +98,9 @@ def get_market_tokens(slug_prefix, window_ts):
             if m and m.get("slug") == slug:
                 outcomes  = json.loads(m.get("outcomes", "[]")) if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
                 token_ids = json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
-                log.info("[" + slug_prefix.rstrip("-") + "] Marché chargé: " + slug
-                         + " | tokens: " + str(token_ids[:2]))
                 return [{"outcome": outcomes[i], "token_id": token_ids[i]} for i in range(len(outcomes))]
-        log.warning("[" + slug_prefix + "] Marché introuvable: " + slug_prefix + str(window_ts))
         return None
-    except Exception as e:
-        log.warning("get_market_tokens: " + str(e))
+    except:
         return None
 
 def get_best_ask(token_id):
@@ -162,17 +128,15 @@ def net_gain_after_fees(up_px, down_px, fee_per_leg):
     cout = up_px * (1 + fee_per_leg) + down_px * (1 + fee_per_leg)
     return 1.0 - cout
 
-
 async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, market_key):
-    global daily_pnl, reserved_balance
-    cout_total = 0.0
+    global daily_pnl
     try:
         from polymarket import AsyncSecureClient
 
-        # ── RE-VERIFICATION PRIX (anti-slippage) ──────────────────────────────
+        # ── RE-VERIFICATION JUSTE AVANT L'ACHAT (anti-slippage) ──
         (up_px, up_depth), (down_px, down_depth) = read_both_asks(up_id, down_id)
         if up_px is None or down_px is None:
-            log.warning("[" + market_key + "] Prix indisponibles au moment d'acheter — abandon")
+            log.warning("[" + market_key + "] Prix indisponibles — abandon")
             return False, 0
 
         total = up_px + down_px
@@ -195,123 +159,105 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
             log.warning("[" + market_key + "] Profondeur insuffisante — abandon")
             return False, 0
 
-        cout_total      = (up_px + down_px) * shares
-        cout_avec_marge = cout_total * 1.05
+        # ── VERIFICATION DU SOLDE (fix v3) ────────────────────────────────────
+        cout_total = (up_px + down_px) * shares
+        solde = get_usdc_balance()
+        if solde is None:
+            log.warning("[" + market_key + "] Solde indisponible — ABANDON par précaution")
+            return False, 0
+        if solde < cout_total * 1.05:
+            log.warning("[" + market_key + "] Solde insuffisant ("
+                        + str(round(solde, 2)) + "$ < "
+                        + str(round(cout_total * 1.05, 2)) + "$ requis) — ABANDON")
+            return False, 0
+        log.info("[" + market_key + "] Solde OK: " + str(round(solde, 2))
+                 + "$ pour " + str(round(cout_total, 2)) + "$ requis")
 
-        # ── VERIFICATION + RESERVATION DU SOLDE (avec lock) ──────────────────
-        with balance_lock:
-            solde = get_usdc_balance()
-            if solde is None:
-                log.warning("[" + market_key + "] Solde indisponible — ABANDON par précaution")
-                return False, 0
+        async with await AsyncSecureClient.create(private_key=PRIVATE_KEY, wallet=WALLET) as client:
 
-            solde_disponible = solde - reserved_balance
-            if solde_disponible < cout_avec_marge:
-                log.warning("[" + market_key + "] Solde insuffisant ("
-                            + str(round(solde_disponible, 2)) + "$ disponible, "
-                            + str(round(cout_avec_marge, 2)) + "$ requis) — ABANDON")
-                return False, 0
-
-            reserved_balance += cout_total
-            log.info("[" + market_key + "] Solde OK: " + str(round(solde, 2))
-                     + "$ | dispo: " + str(round(solde_disponible, 2))
-                     + "$ | réservé: " + str(round(cout_total, 2)) + "$")
-
-        # ── EXECUTION DES ORDRES ───────────────────────────────────────────────
-        try:
-            async with await AsyncSecureClient.create(private_key=PRIVATE_KEY, wallet=WALLET) as client:
-
-                async def buy(tid, px):
-                    try:
-                        resp = await client.place_limit_order(
-                            token_id=tid, side="BUY",
-                            price=str(round(px, 4)), size=str(shares))
-                        if resp.ok:
-                            return True, getattr(resp, "order_id", None) or getattr(resp, "id", None)
-                        return False, None
-                    except Exception as e:
-                        log.error("Achat jambe: " + str(e))
-                        return False, None
-
-                ok_up,   oid_up   = await buy(up_id,   up_px)
-                ok_down, oid_down = await buy(down_id, down_px)
-
-                if not ok_up and not ok_down:
-                    log.warning("[" + market_key + "] Aucune jambe exécutée")
-                    return False, 0
-
-                await asyncio.sleep(6)
-
-                filled = {"up": ok_up, "down": ok_down}
+            async def buy(tid, px):
                 try:
-                    open_orders = None
-                    for meth in ("get_orders", "get_open_orders"):
-                        fn = getattr(client, meth, None)
-                        if fn:
-                            open_orders = await fn()
-                            break
-                    if open_orders is not None:
-                        items = getattr(open_orders, "orders", open_orders)
-                        ids = []
-                        if isinstance(items, list):
-                            for o in items:
-                                oid = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
-                                ids.append(oid)
-                        cancel = getattr(client, "cancel_order", None)
-                        if oid_up and oid_up in ids:
-                            filled["up"] = False
-                            if cancel: await cancel(order_id=oid_up)
-                        if oid_down and oid_down in ids:
-                            filled["down"] = False
-                            if cancel: await cancel(order_id=oid_down)
-                except Exception as ve:
-                    log.warning("Vérif jambes: " + str(ve))
+                    resp = await client.place_limit_order(
+                        token_id=tid, side="BUY",
+                        price=str(round(px, 4)), size=str(shares))
+                    if resp.ok:
+                        return True, getattr(resp, "order_id", None) or getattr(resp, "id", None)
+                    return False, None
+                except Exception as e:
+                    log.error("Achat jambe: " + str(e))
+                    return False, None
 
-                if filled["up"] and filled["down"]:
-                    gain_net = net_gain_after_fees(up_px, down_px, FEE_PER_LEG) * shares
-                    log.info("[" + market_key + "] ✅ ARB VERROUILLÉ | somme "
-                             + str(round(total, 3)) + " | " + str(shares) + " shares"
-                             + " | gain net +" + str(round(gain_net, 2)) + "$")
-                    return True, cout_total
+            ok_up,   oid_up   = await buy(up_id,   up_px)
+            ok_down, oid_down = await buy(down_id, down_px)
 
-                async def sell(tid, px):
-                    try:
-                        sp = max(0.01, round(px - 0.01, 4))
-                        ss = max(0.01, round(shares - 0.01, 2))
-                        await client.place_limit_order(
-                            token_id=tid, side="SELL",
-                            price=str(sp), size=str(ss))
-                    except Exception as e:
-                        log.error("Revente: " + str(e))
-
-                if filled["up"] and not filled["down"]:
-                    log.warning("[" + market_key + "] Jambe DOWN manquante — revente UP")
-                    await sell(up_id, up_px)
-                    daily_pnl -= 0.01 * shares
-                    save_daily_pnl(daily_pnl)
-                    return False, 0
-
-                if filled["down"] and not filled["up"]:
-                    log.warning("[" + market_key + "] Jambe UP manquante — revente DOWN")
-                    await sell(down_id, down_px)
-                    daily_pnl -= 0.01 * shares
-                    save_daily_pnl(daily_pnl)
-                    return False, 0
-
+            if not ok_up and not ok_down:
+                log.warning("[" + market_key + "] Aucune jambe exécutée")
                 return False, 0
 
-        finally:
-            with balance_lock:
-                reserved_balance = max(0.0, reserved_balance - cout_total)
+            await asyncio.sleep(6)
 
+            filled = {"up": ok_up, "down": ok_down}
+            try:
+                open_orders = None
+                for meth in ("get_orders", "get_open_orders"):
+                    fn = getattr(client, meth, None)
+                    if fn:
+                        open_orders = await fn()
+                        break
+                if open_orders is not None:
+                    items = getattr(open_orders, "orders", open_orders)
+                    ids = []
+                    if isinstance(items, list):
+                        for o in items:
+                            oid = o.get("id") if isinstance(o, dict) else getattr(o, "id", None)
+                            ids.append(oid)
+                    cancel = getattr(client, "cancel_order", None)
+                    if oid_up and oid_up in ids:
+                        filled["up"] = False
+                        if cancel: await cancel(order_id=oid_up)
+                    if oid_down and oid_down in ids:
+                        filled["down"] = False
+                        if cancel: await cancel(order_id=oid_down)
+            except Exception as ve:
+                log.warning("Vérif jambes: " + str(ve))
+
+            if filled["up"] and filled["down"]:
+                gain_net = net_gain_after_fees(up_px, down_px, FEE_PER_LEG) * shares
+                log.info("[" + market_key + "] ✅ ARB VERROUILLÉ | somme "
+                         + str(round(total, 3)) + " | " + str(shares) + " shares"
+                         + " | gain net +" + str(round(gain_net, 2)) + "$")
+                return True, (up_px + down_px) * shares
+
+            async def sell(tid, px):
+                try:
+                    sp = max(0.01, round(px - 0.03, 4))
+                    ss = max(0.01, round(shares - 0.01, 2))
+                    await client.place_limit_order(token_id=tid, side="SELL", price=str(sp), size=str(ss))
+                except Exception as e:
+                    log.error("Revente: " + str(e))
+
+            if filled["up"] and not filled["down"]:
+                log.warning("[" + market_key + "] Jambe DOWN manquante — revente UP")
+                await sell(up_id, up_px)
+                perte = 0.04 * shares
+                daily_pnl -= perte
+                save_daily_pnl(daily_pnl)
+                return False, 0
+            if filled["down"] and not filled["up"]:
+                log.warning("[" + market_key + "] Jambe UP manquante — revente DOWN")
+                await sell(down_id, down_px)
+                perte = 0.04 * shares
+                daily_pnl -= perte
+                save_daily_pnl(daily_pnl)
+                return False, 0
+
+            return False, 0
     except Exception as e:
         log.error("Exception arb: " + str(e))
         return False, 0
 
-
 def execute_arb(up_id, up_px, down_id, down_px, shares, market_key):
     return asyncio.run(execute_arb_async(up_id, up_px, down_id, down_px, shares, market_key))
-
 
 def settle_loop():
     global daily_pnl
@@ -336,16 +282,14 @@ def settle_loop():
             log.error("Erreur règlement: " + str(e))
         time.sleep(10)
 
-
 def run():
     global daily_pnl, pnl_date, done_windows
 
-    log.info("Bot ARBITRAGE v4 démarré")
+    log.info("Bot ARBITRAGE v3 démarré")
     log.info("Seuil somme: " + str(SUM_MAX) + " | Gain net min: " + str(MIN_NET_GAIN)
              + " | Frais/jambe: " + str(FEE_PER_LEG)
              + " | Trade: " + str(TRADE_USDC) + "$"
-             + " | Max simultanés: " + str(MAX_CONCURRENT)
-             + " | Debug: " + str(DEBUG_LOGS))
+             + " | Max simultanés: " + str(MAX_CONCURRENT))
     log.info("Marchés: " + ", ".join(SHORT_MARKETS.keys())
              + " | PnL: " + str(round(daily_pnl, 2)))
 
@@ -360,7 +304,7 @@ def run():
     settle_thread.start()
 
     token_cache    = {}
-    last_heartbeat = {}
+    last_heartbeat = 0
 
     while True:
         try:
@@ -411,7 +355,7 @@ def run():
                             del token_cache[k]
                 tokens = token_cache[cache_key]
 
-                up   = next((t for t in tokens if t["outcome"] == "Up"),   None)
+                up   = next((t for t in tokens if t["outcome"] == "Up"), None)
                 down = next((t for t in tokens if t["outcome"] == "Down"), None)
                 if not up or not down:
                     continue
@@ -423,21 +367,12 @@ def run():
                 total = up_px + down_px
                 net   = net_gain_after_fees(up_px, down_px, FEE_PER_LEG)
 
-                # ── LOG A CHAQUE SCAN (debug) ──────────────────────────────────
-                if DEBUG_LOGS:
-                    log.info("[" + mkey + "] somme " + str(round(total, 3))
-                             + " | up " + str(round(up_px, 3))
-                             + " | down " + str(round(down_px, 3))
+                if time.time() - last_heartbeat >= 300:
+                    log.info("[" + mkey + "] scan | somme " + str(round(total, 3))
                              + " | net " + str(round(net, 4))
+                             + " | seuil " + str(SUM_MAX)
                              + " | PnL: " + str(round(daily_pnl, 2)) + "$")
-                else:
-                    # Heartbeat toutes les 5 min seulement
-                    if time.time() - last_heartbeat.get(mkey, 0) >= 300:
-                        log.info("[" + mkey + "] scan | somme " + str(round(total, 3))
-                                 + " | net " + str(round(net, 4))
-                                 + " | seuil " + str(SUM_MAX)
-                                 + " | PnL: " + str(round(daily_pnl, 2)) + "$")
-                        last_heartbeat[mkey] = time.time()
+                    last_heartbeat = time.time()
 
                 if total <= SUM_MAX and net >= MIN_NET_GAIN:
                     shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
@@ -452,9 +387,8 @@ def run():
 
                     ok, cout = execute_arb(up["token_id"], up_px,
                                            down["token_id"], down_px, shares, mkey)
-
+                    done_windows.add(cache_key)
                     if ok:
-                        done_windows.add(cache_key)
                         with arbs_lock:
                             open_arbs.append({
                                 "market":   mkey,
@@ -466,7 +400,6 @@ def run():
         except Exception as e:
             log.error("Erreur boucle: " + str(e))
         time.sleep(SCAN_INTERVAL)
-
 
 if __name__ == "__main__":
     run()
