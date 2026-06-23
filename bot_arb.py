@@ -9,25 +9,34 @@ from datetime import date, datetime, timezone
 # 3. Achat des deux jambes au prix EXACT du carnet (pas de +0.01)
 # 4. Marge de sécurité sur le slippage
 # 5. Abandon immédiat si la somme dépasse le seuil au moment d'acheter
-# 6. Fix solde : fail-safe si indisponible, ABANDON si insuffisant
 # ============================================================
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
-SUM_MAX        = float(os.getenv("ARB_SUM_MAX",        "0.98"))
+# Seuil de somme MAX. Avec frais ~2% (1% par jambe), pour un gain net positif
+# il faut somme + frais < 1. Donc somme < 0.98 minimum, idéalement < 0.96.
+SUM_MAX        = float(os.getenv("ARB_SUM_MAX",        "0.96"))
+
+# Frais estimés par jambe (Polymarket ~1% par côté à l'achat)
 FEE_PER_LEG    = float(os.getenv("ARB_FEE_PER_LEG",   "0.01"))
-MIN_NET_GAIN   = float(os.getenv("ARB_MIN_NET_GAIN",  "0.015"))
+
+# Gain net minimum exigé pour entrer (sécurité)
+MIN_NET_GAIN   = float(os.getenv("ARB_MIN_NET_GAIN",  "0.015"))  # 1.5%
+
 TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC",     "10"))
 MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT",   "3"))
 STOP_LOSS_USDC = float(os.getenv("ARB_STOP_LOSS_USDC", "15"))
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL",  "5"))
 MAX_DAYS_LEFT  = float(os.getenv("ARB_MAX_DAYS",       "7"))
+
+# Slippage toléré : si la somme bouge de plus que ça entre scan et achat, on abandonne
 MAX_SLIPPAGE   = float(os.getenv("ARB_MAX_SLIPPAGE",  "0.01"))
 
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
                           int(os.getenv("ARB_HOUR_END",   "24"))))
 
+# Marchés courts crypto (fenêtres rapides, opportunités fréquentes)
 SHORT_MARKETS = {
     "BTC5":  {"slug": "btc-updown-5m-",  "window": 300},
     "ETH15": {"slug": "eth-updown-15m-", "window": 900},
@@ -72,22 +81,6 @@ open_arbs    = []
 arbs_lock    = threading.Lock()
 done_windows = set()
 
-
-def get_usdc_balance():
-    try:
-        r = SESSION.get("https://data-api.polymarket.com/value",
-                        params={"user": WALLET}, timeout=8)
-        if r.ok:
-            data = r.json()
-            if isinstance(data, list) and len(data) > 0:
-                return float(data[0].get("value", 0))
-            if isinstance(data, dict):
-                return float(data.get("value", data.get("balance", 0)))
-        return None
-    except Exception as e:
-        log.warning("Solde indisponible: " + str(e))
-        return None
-
 def get_market_tokens(slug_prefix, window_ts):
     try:
         slug = slug_prefix + str(window_ts)
@@ -104,6 +97,7 @@ def get_market_tokens(slug_prefix, window_ts):
         return None
 
 def get_best_ask(token_id):
+    """Meilleur prix d'achat + profondeur disponible à ce prix."""
     try:
         r = SESSION.get(CLOB_API + "/book", params={"token_id": token_id}, timeout=8)
         if r.ok:
@@ -116,6 +110,7 @@ def get_best_ask(token_id):
         return None, 0
 
 def read_both_asks(up_id, down_id):
+    """Lit les deux carnets EN PARALLELE pour minimiser le slippage."""
     res = {}
     def _read(side, tid):
         res[side] = get_best_ask(tid)
@@ -125,10 +120,21 @@ def read_both_asks(up_id, down_id):
     return res.get("up", (None, 0)), res.get("down", (None, 0))
 
 def net_gain_after_fees(up_px, down_px, fee_per_leg):
+    """
+    Calcule le gain net réel après frais.
+    Coût total = (up + down) + frais sur les deux jambes
+    Gain à l'expiration = 1.00 (un côté gagne)
+    Net = 1.00 - cout_total
+    """
     cout = up_px * (1 + fee_per_leg) + down_px * (1 + fee_per_leg)
     return 1.0 - cout
 
 async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, market_key):
+    """
+    Exécute l'arbitrage avec RE-VERIFICATION anti-slippage.
+    Avant d'acheter, relit les prix. Si la somme a monté au-dessus du seuil,
+    ABANDONNE — pas de trade perdant.
+    """
     global daily_pnl
     try:
         from polymarket import AsyncSecureClient
@@ -136,22 +142,25 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
         # ── RE-VERIFICATION JUSTE AVANT L'ACHAT (anti-slippage) ──
         (up_px, up_depth), (down_px, down_depth) = read_both_asks(up_id, down_id)
         if up_px is None or down_px is None:
-            log.warning("[" + market_key + "] Prix indisponibles — abandon")
+            log.warning("[" + market_key + "] Prix indisponibles au moment d'acheter — abandon")
             return False, 0
 
         total = up_px + down_px
-        net   = net_gain_after_fees(up_px, down_px, FEE_PER_LEG)
+        net = net_gain_after_fees(up_px, down_px, FEE_PER_LEG)
 
+        # Vérifie que la somme n'a pas dérivé au-dessus du seuil
         if total > SUM_MAX:
             log.warning("[" + market_key + "] Somme remontée à " + str(round(total, 3))
                         + " > " + str(SUM_MAX) + " — ABANDON (anti-slippage)")
             return False, 0
 
+        # Vérifie que le gain net est suffisant
         if net < MIN_NET_GAIN:
             log.warning("[" + market_key + "] Gain net " + str(round(net, 4))
                         + " < " + str(MIN_NET_GAIN) + " — ABANDON")
             return False, 0
 
+        # Recalcule shares avec les prix réels
         shares = min(shares,
                      math.floor(TRADE_USDC / total * 100) / 100,
                      math.floor(min(up_depth, down_depth) * 100) / 100)
@@ -159,22 +168,8 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
             log.warning("[" + market_key + "] Profondeur insuffisante — abandon")
             return False, 0
 
-        # ── VERIFICATION DU SOLDE (fix v3) ────────────────────────────────────
-        cout_total = (up_px + down_px) * shares
-        solde = get_usdc_balance()
-        if solde is None:
-            log.warning("[" + market_key + "] Solde indisponible — ABANDON par précaution")
-            return False, 0
-        if solde < cout_total * 1.05:
-            log.warning("[" + market_key + "] Solde insuffisant ("
-                        + str(round(solde, 2)) + "$ < "
-                        + str(round(cout_total * 1.05, 2)) + "$ requis) — ABANDON")
-            return False, 0
-        log.info("[" + market_key + "] Solde OK: " + str(round(solde, 2))
-                 + "$ pour " + str(round(cout_total, 2)) + "$ requis")
-
         async with await AsyncSecureClient.create(private_key=PRIVATE_KEY, wallet=WALLET) as client:
-
+            # ── ACHAT AU PRIX EXACT DU CARNET (pas de +0.01 qui gonfle le coût) ──
             async def buy(tid, px):
                 try:
                     resp = await client.place_limit_order(
@@ -187,7 +182,7 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
                     log.error("Achat jambe: " + str(e))
                     return False, None
 
-            ok_up,   oid_up   = await buy(up_id,   up_px)
+            ok_up, oid_up     = await buy(up_id, up_px)
             ok_down, oid_down = await buy(down_id, down_px)
 
             if not ok_up and not ok_down:
@@ -196,6 +191,7 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
 
             await asyncio.sleep(6)
 
+            # Vérifie quelles jambes sont passées
             filled = {"up": ok_up, "down": ok_down}
             try:
                 open_orders = None
@@ -221,13 +217,15 @@ async def execute_arb_async(up_id, up_px_scan, down_id, down_px_scan, shares, ma
             except Exception as ve:
                 log.warning("Vérif jambes: " + str(ve))
 
+            # Les deux jambes tenues = arbitrage verrouillé
             if filled["up"] and filled["down"]:
                 gain_net = net_gain_after_fees(up_px, down_px, FEE_PER_LEG) * shares
                 log.info("[" + market_key + "] ✅ ARB VERROUILLÉ | somme "
                          + str(round(total, 3)) + " | " + str(shares) + " shares"
-                         + " | gain net +" + str(round(gain_net, 2)) + "$")
+                         + " | gain net garanti +" + str(round(gain_net, 2)) + "$")
                 return True, (up_px + down_px) * shares
 
+            # Jambe orpheline : revente immédiate
             async def sell(tid, px):
                 try:
                     sp = max(0.01, round(px - 0.03, 4))
@@ -342,6 +340,7 @@ def run():
 
                 if cache_key in done_windows:
                     continue
+                # Ne pas entrer dans les 60 dernières secondes (temps d'exécution)
                 if time_left < 60:
                     continue
 
@@ -367,6 +366,7 @@ def run():
                 total = up_px + down_px
                 net   = net_gain_after_fees(up_px, down_px, FEE_PER_LEG)
 
+                # Heartbeat
                 if time.time() - last_heartbeat >= 300:
                     log.info("[" + mkey + "] scan | somme " + str(round(total, 3))
                              + " | net " + str(round(net, 4))
@@ -374,6 +374,7 @@ def run():
                              + " | PnL: " + str(round(daily_pnl, 2)) + "$")
                     last_heartbeat = time.time()
 
+                # Conditions d'entrée STRICTES
                 if total <= SUM_MAX and net >= MIN_NET_GAIN:
                     shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
                     shares_depth = math.floor(min(up_depth, down_depth) * 100) / 100
