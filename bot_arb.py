@@ -192,8 +192,13 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
             up_buy   = min(0.99, round(up_px + 0.01, 4))
             down_buy = min(0.99, round(down_px + 0.01, 4))
 
-            ok_up, oid_up     = await buy_leg(client, up_id, up_buy, shares)
-            ok_down, oid_down = await buy_leg(client, down_id, down_buy, shares)
+            # CORRECTION : achete les DEUX jambes EN PARALLELE (asyncio.gather)
+            # Avant, elles partaient l'une apres l'autre -> le prix de la 2e bougeait
+            # et l'arbitrage echouait. La, elles partent en meme temps.
+            (ok_up, oid_up), (ok_down, oid_down) = await asyncio.gather(
+                buy_leg(client, up_id, up_buy, shares),
+                buy_leg(client, down_id, down_buy, shares),
+            )
 
             if not ok_up and not ok_down:
                 log.warning("[" + market_key + "] Aucune jambe executee - abandon")
