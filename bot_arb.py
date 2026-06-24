@@ -48,7 +48,8 @@ MARKETS = {
 GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
-PNL_FILE  = "/app/arb_daily_pnl.txt"
+PNL_FILE     = "/app/arb_daily_pnl.txt"
+PNL_HISTORY  = "/app/arb_pnl_history.txt"  # historique cumul 2 semaines
 
 SESSION = requests.Session()
 
@@ -82,6 +83,24 @@ def save_daily_pnl(pnl):
             f.write(str(date.today()) + "\n" + str(round(pnl, 4)))
     except:
         pass
+
+def append_pnl_history(day, pnl):
+    """Ajoute une ligne dans l historique quotidien (2 semaines)."""
+    try:
+        # Charge l historique existant
+        lines = []
+        if os.path.exists(PNL_HISTORY):
+            with open(PNL_HISTORY, "r") as f:
+                lines = [l.strip() for l in f if l.strip()]
+        # Evite les doublons sur la meme date
+        lines = [l for l in lines if not l.startswith(str(day))]
+        lines.append(str(day) + " | " + str(round(pnl, 4)) + "$")
+        # Garde les 14 derniers jours max
+        lines = lines[-14:]
+        with open(PNL_HISTORY, "w") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as e:
+        log.warning("Historique PnL: " + str(e))
 
 daily_pnl   = load_daily_pnl()
 pnl_date    = date.today()
@@ -430,10 +449,29 @@ def run():
             today = date.today()
             if today != pnl_date:
                 log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
+                append_pnl_history(pnl_date, daily_pnl)
                 daily_pnl = 0.0
                 pnl_date  = today
                 done_windows.clear()
                 save_daily_pnl(0.0)
+                # Affiche l historique complet dans les logs
+                try:
+                    if os.path.exists(PNL_HISTORY):
+                        with open(PNL_HISTORY, "r") as f:
+                            hist = f.read().strip()
+                        if hist:
+                            lines = [l for l in hist.split("\n") if l.strip()]
+                            total = 0.0
+                            for l in lines:
+                                try:
+                                    total += float(l.split("|")[1].replace("$","").strip())
+                                except:
+                                    pass
+                            log.info("=== HISTORIQUE PnL ARB (14 jours) ===\n"
+                                     + hist
+                                     + "TOTAL : " + str(round(total, 4)) + "$")
+                except:
+                    pass
 
             # Stop loss jambes orphelines
             if daily_pnl <= -STOP_LOSS_USDC:
