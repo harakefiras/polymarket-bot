@@ -34,7 +34,7 @@ MIN_TIME_LEFT  = int(os.getenv("ARB_MIN_TIME_LEFT", "60"))
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL", "1"))
 
 # AJOUT : prix minimum par jambe (filtre marche desequilibre)
-MIN_LEG_PRICE  = float(os.getenv("ARB_MIN_LEG_PRICE", "0.20"))
+MIN_LEG_PRICE  = float(os.getenv("ARB_MIN_LEG_PRICE", "0.15"))
 
 # Plage horaire active (UTC)
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
@@ -51,6 +51,7 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
 PNL_FILE  = "/app/arb_daily_pnl.txt"
+PNL_HISTORY_FILE = "/app/pnl_history.csv"  # historique cumule (date,pnl,nb_arbs)
 
 SESSION = requests.Session()
 
@@ -85,8 +86,32 @@ def save_daily_pnl(pnl):
     except:
         pass
 
+def append_pnl_history(day, pnl, nb_arbs):
+    """
+    Ecrit/met a jour la ligne du jour dans l'historique CSV.
+    Format : date,pnl,nb_arbs
+    Relit tout, remplace la ligne du jour si elle existe, sinon l'ajoute.
+    """
+    try:
+        rows = {}
+        if os.path.exists(PNL_HISTORY_FILE):
+            with open(PNL_HISTORY_FILE, "r") as f:
+                for line in f.read().strip().split("\n"):
+                    if line and not line.startswith("date"):
+                        parts = line.split(",")
+                        if len(parts) >= 3:
+                            rows[parts[0]] = (parts[1], parts[2])
+        rows[str(day)] = (str(round(pnl, 4)), str(nb_arbs))
+        with open(PNL_HISTORY_FILE, "w") as f:
+            f.write("date,pnl,nb_arbs\n")
+            for d in sorted(rows.keys()):
+                f.write(d + "," + rows[d][0] + "," + rows[d][1] + "\n")
+    except Exception as e:
+        log.warning("Historique PnL: " + str(e))
+
 daily_pnl   = load_daily_pnl()
 pnl_date    = date.today()
+daily_arbs  = 0       # nombre d'arbs verrouilles aujourd'hui
 open_arbs   = []      # arbitrages en attente d'expiration
 arbs_lock   = threading.Lock()
 done_windows = set()  # fenetres deja arbitrees (cle market+ts)
@@ -272,7 +297,7 @@ def execute_arb(up_id, up_px, down_id, down_px, shares, market_key, window_ts):
 # ============================================================
 
 def settle_loop():
-    global daily_pnl
+    global daily_pnl, daily_arbs
     log.info("Thread reglement demarre")
     while True:
         try:
@@ -286,6 +311,7 @@ def settle_loop():
                     gain = (1.0 - arb["sum_paid"]) * arb["shares"]
                     daily_pnl += gain
                     save_daily_pnl(daily_pnl)
+                    append_pnl_history(date.today(), daily_pnl, daily_arbs)
                     log.info("[" + arb["market"] + "] ARB REGLE | +"
                              + str(round(gain, 2)) + "$ | PnL jour: "
                              + str(round(daily_pnl, 2)) + "$")
@@ -393,7 +419,7 @@ def global_scan_loop():
 # ============================================================
 
 def run():
-    global daily_pnl, pnl_date
+    global daily_pnl, pnl_date, daily_arbs
 
     log.info("Bot ARBITRAGE Yes+No demarre")
     log.info("Seuil somme: " + str(SUM_MAX) + " | Trade: "
@@ -422,8 +448,12 @@ def run():
         try:
             today = date.today()
             if today != pnl_date:
-                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
+                # Sauvegarde definitive de la veille avant reset
+                append_pnl_history(pnl_date, daily_pnl, daily_arbs)
+                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2))
+                         + " | arbs hier: " + str(daily_arbs))
                 daily_pnl = 0.0
+                daily_arbs = 0
                 pnl_date  = today
                 done_windows.clear()
                 save_daily_pnl(0.0)
@@ -515,6 +545,7 @@ def run():
                                             shares, mkey, window_ts)
                     done_windows.add(cache_key)
                     if ok:
+                        daily_arbs += 1
                         with arbs_lock:
                             open_arbs.append({
                                 "market":   mkey,
