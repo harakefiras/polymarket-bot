@@ -9,13 +9,13 @@ import threading
 # Gain garanti = 1.00 - somme payee, SANS pari directionnel.
 # Risque unique : jambe orpheline (un seul cote execute)
 # -> gere par verification + revente immediate.
-# SEUL AJOUT vs original : filtre marche desequilibre (min 0.20)
 # ============================================================
 
 PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
 WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
 # Seuil d'arbitrage : somme max payee pour les deux cotes
+# 0.97 = 3% de gain brut minimum (couvre les frais ~2%)
 SUM_MAX        = float(os.getenv("ARB_SUM_MAX", "0.97"))
 
 # Capital par trade (sur CHAQUE arbitrage, les deux jambes comprises)
@@ -28,12 +28,12 @@ MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT", "3"))
 STOP_LOSS_USDC = float(os.getenv("ARB_STOP_LOSS_USDC", "10"))
 
 # Ne pas entrer dans les X dernieres secondes d'une fenetre
+# (le temps que les deux jambes s'executent)
 MIN_TIME_LEFT  = int(os.getenv("ARB_MIN_TIME_LEFT", "60"))
 
 # Frequence de scan (secondes) - rapide, les fenetres durent peu
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL", "1"))
 
-# AJOUT : prix minimum par jambe (filtre marche desequilibre)
 # Plage horaire active (UTC)
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
                           int(os.getenv("ARB_HOUR_END",   "24"))))
@@ -49,7 +49,6 @@ GAMMA_API = "https://gamma-api.polymarket.com"
 CLOB_API  = "https://clob.polymarket.com"
 
 PNL_FILE  = "/app/arb_daily_pnl.txt"
-PNL_HISTORY_FILE = "/app/pnl_history.csv"  # historique cumule (date,pnl,nb_arbs)
 
 SESSION = requests.Session()
 
@@ -84,32 +83,8 @@ def save_daily_pnl(pnl):
     except:
         pass
 
-def append_pnl_history(day, pnl, nb_arbs):
-    """
-    Ecrit/met a jour la ligne du jour dans l'historique CSV.
-    Format : date,pnl,nb_arbs
-    Relit tout, remplace la ligne du jour si elle existe, sinon l'ajoute.
-    """
-    try:
-        rows = {}
-        if os.path.exists(PNL_HISTORY_FILE):
-            with open(PNL_HISTORY_FILE, "r") as f:
-                for line in f.read().strip().split("\n"):
-                    if line and not line.startswith("date"):
-                        parts = line.split(",")
-                        if len(parts) >= 3:
-                            rows[parts[0]] = (parts[1], parts[2])
-        rows[str(day)] = (str(round(pnl, 4)), str(nb_arbs))
-        with open(PNL_HISTORY_FILE, "w") as f:
-            f.write("date,pnl,nb_arbs\n")
-            for d in sorted(rows.keys()):
-                f.write(d + "," + rows[d][0] + "," + rows[d][1] + "\n")
-    except Exception as e:
-        log.warning("Historique PnL: " + str(e))
-
 daily_pnl   = load_daily_pnl()
 pnl_date    = date.today()
-daily_arbs  = 0       # nombre d'arbs verrouilles aujourd'hui
 open_arbs   = []      # arbitrages en attente d'expiration
 arbs_lock   = threading.Lock()
 done_windows = set()  # fenetres deja arbitrees (cle market+ts)
@@ -149,6 +124,8 @@ def get_best_ask(token_id):
             book = r.json()
             asks = book.get("asks", [])
             if asks:
+                # asks tries du moins cher au plus cher selon l'API ;
+                # on prend le meilleur (prix le plus bas)
                 best = min(asks, key=lambda a: float(a["price"]))
                 return float(best["price"]), float(best["size"])
         return None, 0
@@ -225,33 +202,7 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
             # Attente courte puis verification des deux jambes
             await asyncio.sleep(8)
 
-            # ── VERIFICATION REELLE DES JAMBES ────────────────────────────────
-            # BUG CORRIGE : avant, on supposait filled=True (base sur HTTP 200)
-            # et on passait a False seulement si l'ordre etait encore "open".
-            # Si get_orders echouait, on declarait ARB VERROUILLE a tort.
-            # Maintenant : on verifie POSITIVEMENT les positions reelles.
-            # Une jambe n'est consideree remplie que si on la trouve dans les
-            # positions OU si l'ordre n'est plus ni open ni annulable.
-
-            def _check_position(token_id):
-                """Verifie via l'API data si on detient reellement le token."""
-                try:
-                    r = SESSION.get("https://data-api.polymarket.com/positions",
-                                    params={"user": WALLET}, timeout=8)
-                    if r.ok:
-                        data = r.json()
-                        if isinstance(data, list):
-                            for p in data:
-                                pid = str(p.get("asset", p.get("token_id", "")))
-                                size = float(p.get("size", 0))
-                                if pid == str(token_id) and size > 0:
-                                    return True
-                    return False
-                except Exception:
-                    return None  # indetermine
-
-            # Etat des ordres encore ouverts (non remplis)
-            still_open = {"up": False, "down": False}
+            filled = {"up": ok_up, "down": ok_down}
             try:
                 open_orders = None
                 for meth in ("get_orders", "get_open_orders"):
@@ -269,42 +220,15 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
                             ids.append(oid)
                     cancel = getattr(client, "cancel_order", None)
                     if oid_up and oid_up in ids:
-                        still_open["up"] = True
+                        filled["up"] = False
                         if cancel:
                             await cancel(order_id=oid_up)
                     if oid_down and oid_down in ids:
-                        still_open["down"] = True
+                        filled["down"] = False
                         if cancel:
                             await cancel(order_id=oid_down)
             except Exception as ve:
-                log.warning("Verif ordres ouverts: " + str(ve))
-
-            # Confirmation positive par les positions reelles
-            pos_up   = _check_position(up_id)
-            pos_down = _check_position(down_id)
-
-            # Une jambe est remplie SEULEMENT si :
-            # - l'ordre initial a ete accepte (ok)
-            # - ET elle n'est plus dans les ordres ouverts
-            # - ET (confirmation position True, OU position indeterminee mais ordre parti)
-            def _is_filled(ok, side, pos):
-                if not ok:
-                    return False
-                if still_open[side]:
-                    return False  # encore ouvert = pas rempli
-                if pos is True:
-                    return True   # confirme par position
-                if pos is False:
-                    return False  # confirme PAS de position
-                return True       # position indeterminee, ordre parti -> suppose rempli
-
-            filled = {
-                "up":   _is_filled(ok_up,   "up",   pos_up),
-                "down": _is_filled(ok_down, "down", pos_down),
-            }
-            log.info("[" + market_key + "] Jambes reelles -> up:"
-                     + str(filled["up"]) + " down:" + str(filled["down"])
-                     + " (pos up:" + str(pos_up) + " down:" + str(pos_down) + ")")
+                log.warning("Verif jambes impossible: " + str(ve))
 
             # Cas 1 : les deux jambes tenues -> arbitrage verrouille
             if filled["up"] and filled["down"]:
@@ -348,7 +272,7 @@ def execute_arb(up_id, up_px, down_id, down_px, shares, market_key, window_ts):
 # ============================================================
 
 def settle_loop():
-    global daily_pnl, daily_arbs
+    global daily_pnl
     log.info("Thread reglement demarre")
     while True:
         try:
@@ -362,7 +286,6 @@ def settle_loop():
                     gain = (1.0 - arb["sum_paid"]) * arb["shares"]
                     daily_pnl += gain
                     save_daily_pnl(daily_pnl)
-                    append_pnl_history(date.today(), daily_pnl, daily_arbs)
                     log.info("[" + arb["market"] + "] ARB REGLE | +"
                              + str(round(gain, 2)) + "$ | PnL jour: "
                              + str(round(daily_pnl, 2)) + "$")
@@ -376,11 +299,12 @@ def settle_loop():
 
 # ============================================================
 # SCANNER GLOBAL : tous les marches actifs (sport, CdM, etc.)
+# Les marches peu surveilles gardent parfois Yes+No < 1 longtemps
 # ============================================================
 
 GLOBAL_SCAN_INTERVAL = int(os.getenv("ARB_GLOBAL_SCAN_INTERVAL", "60"))
-GLOBAL_MIN_DAYS_LEFT = 0
-GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))
+GLOBAL_MIN_DAYS_LEFT = 0      # marches qui se resolvent bientot acceptes
+GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))  # max 7 jours de blocage capital
 
 def scan_global_markets():
     """Scanne les marches actifs tries par volume, cherche Yes+No < seuil."""
@@ -400,6 +324,7 @@ def scan_global_markets():
                     if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
                 if len(outcomes) != 2 or len(token_ids) != 2:
                     continue
+                # date de fin : eviter de bloquer le capital trop longtemps
                 end = m.get("endDate") or m.get("end_date_iso")
                 if end:
                     try:
@@ -456,6 +381,7 @@ def global_scan_loop():
                                 "market":   "GLOBAL",
                                 "sum_paid": round(o["p0"] + o["p1"] + 0.02, 4),
                                 "shares":   shares,
+                                # regle a la resolution : on garde 7 jours max en memoire
                                 "expiry":   int(time.time()) + 7 * 86400,
                             })
         except Exception as e:
@@ -467,7 +393,7 @@ def global_scan_loop():
 # ============================================================
 
 def run():
-    global daily_pnl, pnl_date, daily_arbs
+    global daily_pnl, pnl_date
 
     log.info("Bot ARBITRAGE Yes+No demarre")
     log.info("Seuil somme: " + str(SUM_MAX) + " | Trade: "
@@ -489,23 +415,22 @@ def run():
     global_thread = threading.Thread(target=global_scan_loop, daemon=True)
     global_thread.start()
 
+    # cache des tokens par fenetre pour eviter les requetes repetees
     token_cache = {}
     last_heartbeat = 0
 
     while True:
         try:
+            # Reset journalier
             today = date.today()
             if today != pnl_date:
-                # Sauvegarde definitive de la veille avant reset
-                append_pnl_history(pnl_date, daily_pnl, daily_arbs)
-                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2))
-                         + " | arbs hier: " + str(daily_arbs))
+                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
                 daily_pnl = 0.0
-                daily_arbs = 0
                 pnl_date  = today
                 done_windows.clear()
                 save_daily_pnl(0.0)
 
+            # Stop loss jambes orphelines
             if daily_pnl <= -STOP_LOSS_USDC:
                 log.warning("Stop-loss arbitrage atteint - pause 1h")
                 time.sleep(3600)
@@ -530,16 +455,19 @@ def run():
                 time_left = (window_ts + wsize) - now
                 cache_key = mkey + "_" + str(window_ts)
 
+                # fenetre deja traitee ou trop proche de l'expiration
                 if cache_key in done_windows:
                     continue
                 if time_left < MIN_TIME_LEFT:
                     continue
 
+                # tokens de la fenetre (avec cache)
                 if cache_key not in token_cache:
                     tokens = get_market_tokens(mcfg["slug"], window_ts)
                     if not tokens or len(tokens) < 2:
                         continue
                     token_cache[cache_key] = tokens
+                    # nettoie le cache
                     if len(token_cache) > 30:
                         for k in list(token_cache.keys())[:-30]:
                             del token_cache[k]
@@ -550,6 +478,7 @@ def run():
                 if not up or not down:
                     continue
 
+                # lit les deux carnets EN PARALLELE (gain ~50% latence)
                 res = {}
                 def _read(side, tid):
                     res[side] = get_best_ask(tid)
@@ -563,6 +492,7 @@ def run():
 
                 total = up_px + down_px
 
+                # Heartbeat : toutes les 5 min, log de la somme observee
                 if time.time() - last_heartbeat >= 300:
                     log.info("[" + mkey + "] scan actif | somme "
                              + str(round(total, 3)) + " | seuil "
@@ -571,6 +501,7 @@ def run():
                     last_heartbeat = time.time()
 
                 if total <= SUM_MAX:
+                    # taille : limitee par le capital ET la profondeur dispo
                     shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
                     shares_depth = math.floor(min(up_depth, down_depth) * 100) / 100
                     shares       = min(shares_cap, shares_depth)
@@ -589,7 +520,6 @@ def run():
                                             shares, mkey, window_ts)
                     done_windows.add(cache_key)
                     if ok:
-                        daily_arbs += 1
                         with arbs_lock:
                             open_arbs.append({
                                 "market":   mkey,
