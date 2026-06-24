@@ -34,8 +34,6 @@ MIN_TIME_LEFT  = int(os.getenv("ARB_MIN_TIME_LEFT", "60"))
 SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL", "1"))
 
 # AJOUT : prix minimum par jambe (filtre marche desequilibre)
-MIN_LEG_PRICE  = float(os.getenv("ARB_MIN_LEG_PRICE", "0.15"))
-
 # Plage horaire active (UTC)
 ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
                           int(os.getenv("ARB_HOUR_END",   "24"))))
@@ -227,7 +225,33 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
             # Attente courte puis verification des deux jambes
             await asyncio.sleep(8)
 
-            filled = {"up": ok_up, "down": ok_down}
+            # ── VERIFICATION REELLE DES JAMBES ────────────────────────────────
+            # BUG CORRIGE : avant, on supposait filled=True (base sur HTTP 200)
+            # et on passait a False seulement si l'ordre etait encore "open".
+            # Si get_orders echouait, on declarait ARB VERROUILLE a tort.
+            # Maintenant : on verifie POSITIVEMENT les positions reelles.
+            # Une jambe n'est consideree remplie que si on la trouve dans les
+            # positions OU si l'ordre n'est plus ni open ni annulable.
+
+            def _check_position(token_id):
+                """Verifie via l'API data si on detient reellement le token."""
+                try:
+                    r = SESSION.get("https://data-api.polymarket.com/positions",
+                                    params={"user": WALLET}, timeout=8)
+                    if r.ok:
+                        data = r.json()
+                        if isinstance(data, list):
+                            for p in data:
+                                pid = str(p.get("asset", p.get("token_id", "")))
+                                size = float(p.get("size", 0))
+                                if pid == str(token_id) and size > 0:
+                                    return True
+                    return False
+                except Exception:
+                    return None  # indetermine
+
+            # Etat des ordres encore ouverts (non remplis)
+            still_open = {"up": False, "down": False}
             try:
                 open_orders = None
                 for meth in ("get_orders", "get_open_orders"):
@@ -245,15 +269,42 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
                             ids.append(oid)
                     cancel = getattr(client, "cancel_order", None)
                     if oid_up and oid_up in ids:
-                        filled["up"] = False
+                        still_open["up"] = True
                         if cancel:
                             await cancel(order_id=oid_up)
                     if oid_down and oid_down in ids:
-                        filled["down"] = False
+                        still_open["down"] = True
                         if cancel:
                             await cancel(order_id=oid_down)
             except Exception as ve:
-                log.warning("Verif jambes impossible: " + str(ve))
+                log.warning("Verif ordres ouverts: " + str(ve))
+
+            # Confirmation positive par les positions reelles
+            pos_up   = _check_position(up_id)
+            pos_down = _check_position(down_id)
+
+            # Une jambe est remplie SEULEMENT si :
+            # - l'ordre initial a ete accepte (ok)
+            # - ET elle n'est plus dans les ordres ouverts
+            # - ET (confirmation position True, OU position indeterminee mais ordre parti)
+            def _is_filled(ok, side, pos):
+                if not ok:
+                    return False
+                if still_open[side]:
+                    return False  # encore ouvert = pas rempli
+                if pos is True:
+                    return True   # confirme par position
+                if pos is False:
+                    return False  # confirme PAS de position
+                return True       # position indeterminee, ordre parti -> suppose rempli
+
+            filled = {
+                "up":   _is_filled(ok_up,   "up",   pos_up),
+                "down": _is_filled(ok_down, "down", pos_down),
+            }
+            log.info("[" + market_key + "] Jambes reelles -> up:"
+                     + str(filled["up"]) + " down:" + str(filled["down"])
+                     + " (pos up:" + str(pos_up) + " down:" + str(pos_down) + ")")
 
             # Cas 1 : les deux jambes tenues -> arbitrage verrouille
             if filled["up"] and filled["down"]:
@@ -363,9 +414,6 @@ def scan_global_markets():
                 if a0 is None or a1 is None:
                     continue
                 total = a0 + a1
-                # AJOUT filtre desequilibre
-                if a0 < MIN_LEG_PRICE or a1 < MIN_LEG_PRICE:
-                    continue
                 if total <= SUM_MAX:
                     found.append({
                         "question": m.get("question", "?")[:60],
@@ -425,7 +473,7 @@ def run():
     log.info("Seuil somme: " + str(SUM_MAX) + " | Trade: "
              + str(TRADE_USDC) + "$ | Max simultanes: "
              + str(MAX_CONCURRENT) + " | SL jour: "
-             + str(STOP_LOSS_USDC) + "$ | Min leg: " + str(MIN_LEG_PRICE))
+             + str(STOP_LOSS_USDC) + "$")
     log.info("Marches: " + ", ".join(MARKETS.keys())
              + " | PnL: " + str(round(daily_pnl, 2)))
 
@@ -521,10 +569,6 @@ def run():
                              + str(SUM_MAX) + " | PnL jour: "
                              + str(round(daily_pnl, 2)) + "$")
                     last_heartbeat = time.time()
-
-                # ── AJOUT : filtre marche desequilibre ──
-                if up_px < MIN_LEG_PRICE or down_px < MIN_LEG_PRICE:
-                    continue
 
                 if total <= SUM_MAX:
                     shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
