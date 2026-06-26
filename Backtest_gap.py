@@ -155,12 +155,16 @@ def backtest_crypto(crypto_name, config):
             token_ids= json.loads(m.get("clobTokenIds", "[]")) if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
 
             if not winner or len(token_ids) < 2 or len(outcomes) < 2:
+                if processed == 0 and markets.index(m) < 3:
+                    print("  DEBUG: skip - winner=" + str(winner) + " tokens=" + str(len(token_ids)))
                 continue
 
             # Timestamp de la fenetre depuis le slug
             try:
                 window_ts = int(slug.split("-")[-1])
             except:
+                if processed == 0:
+                    print("  DEBUG: slug parse erreur - slug=" + str(slug))
                 continue
 
             # Timestamps cles
@@ -171,16 +175,22 @@ def backtest_crypto(crypto_name, config):
             # Recupere les bougies crypto sur la fenetre
             candles = get_crypto_candles(product, t_start - 60, t_end + 60)
             if not candles:
+                if processed == 0 and len([x for x in markets[:5] if x]):
+                    print("  DEBUG: pas de bougies pour window_ts=" + str(window_ts))
                 continue
 
             # Prix au debut de la fenetre (strike)
             strike = price_at_ts(candles, t_start)
             if not strike or strike <= 0:
+                if processed == 0:
+                    print("  DEBUG: strike introuvable pour window_ts=" + str(window_ts))
                 continue
 
             # Prix au moment d'entree possible
             price_at_entry = price_at_ts(candles, t_entry)
             if not price_at_entry or price_at_entry <= 0:
+                if processed == 0:
+                    print("  DEBUG: price_at_entry introuvable")
                 continue
 
             # Gap observe
