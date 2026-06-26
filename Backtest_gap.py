@@ -47,6 +47,22 @@ def load_subset(name):
         return pd.concat(dfs, ignore_index=True)
     return None
 
+
+# SCAN : liste les vrais fichiers disponibles sur Hugging Face
+print("=== SCAN DES FICHIERS DISPONIBLES ===")
+for subset in ["resolutions", "price_history", "crypto_prices", "markets"]:
+    url = f"https://huggingface.co/api/datasets/BrockMisner/polymarket-crypto-5m-15m/tree/main/{subset}"
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        print(f"  {subset}: status {r.status_code}")
+        if r.ok:
+            files = r.json()
+            for f in files[:5]:
+                print(f"    -> {f.get('path')} ({f.get('size',0)} bytes)")
+    except Exception as e:
+        print(f"  {subset}: erreur {e}")
+print()
+
 print("BACKTEST GAP OPTIMAL - Polymarket BTC/ETH/SOL")
 print("Dataset: BrockMisner/polymarket-crypto-5m-15m (Hugging Face)")
 print()
