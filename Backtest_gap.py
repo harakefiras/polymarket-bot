@@ -7,12 +7,11 @@ Utilise resolutions + price_history + crypto_prices
 import requests, io, time, math
 from datetime import datetime, timezone
 
-try:
-    import pandas as pd
-except ImportError:
-    import subprocess, sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "--break-system-packages", "-q"])
-    import pandas as pd
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "pyarrow", "fastparquet", "-q"], 
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+import pandas as pd
+print("pandas OK")
 
 # Dataset BrockMisner (miroir public de obadiaha, meme structure)
 HF_BASE = "https://huggingface.co/datasets/BrockMisner/polymarket-crypto-5m-15m/resolve/main"
