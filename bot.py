@@ -484,9 +484,11 @@ def monitor_loop():
                                  + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
 
-                # 4. Stop loss -30% du prix d'entree
-                elif current <= entry * (1 - STOP_LOSS_PCT):
-                    log.info("STOP LOSS -30%! @ " + str(round(current, 3)))
+                # 4. Stop loss : valeur position < mise * (1 - 30%)
+                elif current * shares <= pos["size"] * (1 - STOP_LOSS_PCT):
+                    val = round(current * shares, 2)
+                    log.info("STOP LOSS -30%! valeur " + str(val)
+                             + "$ < " + str(round(pos["size"] * (1 - STOP_LOSS_PCT), 2)) + "$")
                     if sell_order(token_id, shares, "SL-30%", current):
                         pnl = (max(0.01, current - 0.04) - entry) * shares
                         daily_pnl += pnl
