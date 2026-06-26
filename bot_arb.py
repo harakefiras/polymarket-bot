@@ -359,7 +359,6 @@ def is_live_match(end_ts):
 def scan_global_markets():
     """Scanne les marches sportifs actifs, cherche Yes+No < seuil."""
     found = []
-    n_sport = 0
     try:
         r = SESSION.get(GAMMA_API + "/markets",
                         params={"active": "true", "closed": "false",
@@ -381,7 +380,6 @@ def scan_global_markets():
                 # FILTRE 1 : sport uniquement
                 if not is_sport_market(question):
                     continue
-                n_sport += 1
 
                 # FILTRE 2 : date de fin (pas trop loin)
                 end = m.get("endDate") or m.get("end_date_iso")
@@ -415,10 +413,6 @@ def scan_global_markets():
 
         # Trie : matchs en direct d'abord, puis par somme la plus basse
         found.sort(key=lambda x: (not x["live"], x["total"]))
-
-        # Log debug : combien de marches sport scannés
-        log.info("[GLOBAL] " + str(len(found)) + " marche(s) sport < seuil | "
-                 + str(n_sport) + " marches sport vus au total")
 
     except Exception as e:
         log.error("Scan global: " + str(e))
