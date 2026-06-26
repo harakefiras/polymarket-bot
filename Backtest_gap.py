@@ -1,26 +1,20 @@
 """
 BACKTEST GAP OPTIMAL - Dataset Hugging Face
-Dataset: obadiaha/polymarket-crypto-5m-15m
-Utilise resolutions + price_history + crypto_prices
+Dataset: BrockMisner/polymarket-crypto-5m-15m
 """
 
-import requests, io, time, math
-from datetime import datetime, timezone
-
-import subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "pyarrow", "fastparquet", "-q"], 
+import requests, io, time, sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas", "pyarrow", "-q"],
                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 import pandas as pd
 print("pandas OK")
 
-# Dataset BrockMisner (miroir public de obadiaha, meme structure)
-HF_BASE = "https://huggingface.co/datasets/BrockMisner/polymarket-crypto-5m-15m/resolve/main"
-
-GAPS_PCT   = [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20]
-ENTRY_MIN  = 0.52
-ENTRY_MAX  = 0.68
-ENTRY_SEC  = {"BTC": 60, "ETH": 180, "SOL": 180}
-WINDOW_SEC = {"BTC": 300, "ETH": 900, "SOL": 900}
+HF_BASE   = "https://huggingface.co/datasets/BrockMisner/polymarket-crypto-5m-15m/resolve/main"
+GAPS_PCT  = [0.02, 0.04, 0.06, 0.08, 0.10, 0.12, 0.15, 0.20]
+ENTRY_MIN = 0.52
+ENTRY_MAX = 0.68
+ENTRY_SEC = {"BTC": 60,  "ETH": 180, "SOL": 180}
+WIN_SEC   = {"BTC": 300, "ETH": 900, "SOL": 900}
 
 def fetch(url):
     try:
@@ -33,180 +27,143 @@ def fetch(url):
         print("  Erreur:", str(e)[:80])
         return None
 
-def load_subset(name):
-    """Charge un subset du dataset (essaie part-0 a part-4)."""
+def list_files(subset):
+    r = requests.get(
+        f"https://huggingface.co/api/datasets/BrockMisner/polymarket-crypto-5m-15m/tree/main/{subset}",
+        timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+    if r.ok:
+        return [f["path"] for f in r.json()]
+    return []
+
+def load_subset(subset):
+    files = list_files(subset)
+    print(f"  {subset}: {len(files)} fichiers")
     dfs = []
-    for i in range(5):
-        url = f"{HF_BASE}/{name}/part-{i}.parquet"
-        df  = fetch(url)
+    for path in files:
+        df = fetch(f"{HF_BASE}/{path}")
         if df is not None:
             dfs.append(df)
-            print(f"  {name}/part-{i}: {len(df)} lignes")
-        time.sleep(0.3)
-    if dfs:
-        return pd.concat(dfs, ignore_index=True)
-    return None
+        time.sleep(0.2)
+    return pd.concat(dfs, ignore_index=True) if dfs else None
 
-
-# SCAN : liste les vrais fichiers disponibles sur Hugging Face
-print("=== SCAN DES FICHIERS DISPONIBLES ===")
-for subset in ["resolutions", "price_history", "crypto_prices", "markets"]:
-    url = f"https://huggingface.co/api/datasets/BrockMisner/polymarket-crypto-5m-15m/tree/main/{subset}"
-    try:
-        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-        print(f"  {subset}: status {r.status_code}")
-        if r.ok:
-            files = r.json()
-            for f in files[:5]:
-                print(f"    -> {f.get('path')} ({f.get('size',0)} bytes)")
-    except Exception as e:
-        print(f"  {subset}: erreur {e}")
-print()
-
-print("BACKTEST GAP OPTIMAL - Polymarket BTC/ETH/SOL")
-print("Dataset: BrockMisner/polymarket-crypto-5m-15m (Hugging Face)")
-print()
-
-# Charge les 3 subsets necessaires
-print("=== Chargement resolutions ===")
-res = load_subset("resolutions")
-if res is None:
-    print("ERREUR: resolutions introuvables")
-    exit(1)
-print(f"Resolutions: {len(res)} lignes | Colonnes: {list(res.columns)}")
-
-print("\n=== Chargement price_history ===")
-ph = load_subset("price_history")
-if ph is None:
-    print("ERREUR: price_history introuvable")
-    exit(1)
-print(f"Price history: {len(ph)} lignes | Colonnes: {list(ph.columns)}")
-
-print("\n=== Chargement crypto_prices ===")
-cp = load_subset("crypto_prices")
-if cp is None:
-    print("ERREUR: crypto_prices introuvable")
-    exit(1)
-print(f"Crypto prices: {len(cp)} lignes | Colonnes: {list(cp.columns)}")
-
-# Normalise les timestamps en secondes
 def to_ts(series):
     try:
         return pd.to_datetime(series, utc=True).astype("int64") // 10**9
     except:
         return series.astype("int64")
 
-res["ts"]    = to_ts(res["resolved_at"] if "resolved_at" in res.columns else res.iloc[:,0])
-ph["ts"]     = to_ts(ph["timestamp"])
-cp["ts"]     = to_ts(cp["timestamp"])
-cp["asset"]  = cp["asset"].str.upper()
-ph["asset"]  = ph["asset"].str.upper()
-res["asset"] = res["asset"].str.upper()
+print("BACKTEST GAP OPTIMAL - Polymarket BTC/ETH/SOL")
+print()
+
+# Charge les donnees
+print("=== resolutions ===")
+res = load_subset("resolutions")
+print(f"  {len(res)} lignes | {list(res.columns)}")
+
+print("=== price_history ===")
+ph = load_subset("price_history")
+print(f"  {len(ph)} lignes | {list(ph.columns)}")
+
+print("=== crypto_prices ===")
+cp = load_subset("crypto_prices")
+print(f"  {len(cp)} lignes | {list(cp.columns)}")
+
+# Normalise timestamps
+res["ts"] = to_ts(res["resolved_at"])
+ph["ts"]  = to_ts(ph["timestamp"])
+cp["ts"]  = to_ts(cp["timestamp"])
+cp["asset"] = cp["asset"].str.upper()
+ph["asset"] = ph["asset"].str.upper()
+res["asset"]= res["asset"].str.upper()
 
 print("\n" + "="*50)
-print("BACKTEST PAR CRYPTO")
-print("="*50)
-
-final_results = {}
+final = {}
 
 for crypto in ["BTC", "ETH", "SOL"]:
     print(f"\n--- {crypto} ---")
-    window_size  = WINDOW_SEC[crypto]
-    entry_window = ENTRY_SEC[crypto]
-
-    # Filtre par crypto
     res_c = res[res["asset"] == crypto].copy()
     ph_c  = ph[ph["asset"]  == crypto].copy()
     cp_c  = cp[cp["asset"]  == crypto].copy()
+    print(f"  Marches: {len(res_c)} | Tokens: {len(ph_c)} | Crypto: {len(cp_c)}")
 
-    print(f"  Marches resolus: {len(res_c)} | Prix tokens: {len(ph_c)} | Prix crypto: {len(cp_c)}")
-
-    if len(res_c) == 0:
-        print(f"  Aucun marche resolu pour {crypto}")
+    if len(res_c) == 0 or len(cp_c) == 0:
+        print("  Donnees insuffisantes")
+        final[crypto] = (None, 0)
         continue
 
-    results   = {g: {"wins": 0, "losses": 0, "skipped": 0} for g in GAPS_PCT}
+    results = {g: {"wins": 0, "losses": 0, "skipped": 0} for g in GAPS_PCT}
     processed = 0
 
     for _, row in res_c.iterrows():
         try:
             market_id = row["market_id"]
-            outcome   = str(row["outcome"]).strip()  # "Up" ou "Down"
+            outcome   = str(row["outcome"]).strip()
             t_res     = int(row["ts"])
-            t_start   = t_res - window_size
-            t_entry   = t_start + entry_window
+            t_start   = t_res - WIN_SEC[crypto]
+            t_entry   = t_start + ENTRY_SEC[crypto]
 
-            # Prix crypto au strike (debut fenetre)
-            cp_window = cp_c[(cp_c["ts"] >= t_start - 120) & (cp_c["ts"] <= t_start + 120)]
-            if cp_window.empty:
+            # Prix crypto au strike
+            cp_s = cp_c[(cp_c["ts"] >= t_start - 120) & (cp_c["ts"] <= t_start + 120)]
+            if cp_s.empty:
                 continue
-            strike = float(cp_window.iloc[0]["open"] if "open" in cp_window.columns else cp_window.iloc[0]["close"])
+            strike = float(cp_s.iloc[0]["open"] if "open" in cp_s.columns else cp_s.iloc[0]["close"])
             if strike <= 0:
                 continue
 
             # Prix crypto a l'entree
-            cp_entry = cp_c[(cp_c["ts"] >= t_entry - 120) & (cp_c["ts"] <= t_entry + 120)]
-            if cp_entry.empty:
+            cp_e = cp_c[(cp_c["ts"] >= t_entry - 120) & (cp_c["ts"] <= t_entry + 120)]
+            if cp_e.empty:
                 continue
-            price_at_entry = float(cp_entry.iloc[0]["open"] if "open" in cp_entry.columns else cp_entry.iloc[0]["close"])
-            if price_at_entry <= 0:
+            price_e = float(cp_e.iloc[0]["open"] if "open" in cp_e.columns else cp_e.iloc[0]["close"])
+            if price_e <= 0:
                 continue
 
-            gap       = price_at_entry - strike
+            gap       = price_e - strike
             gap_pct   = abs(gap) / strike * 100
             direction = "Up" if gap > 0 else "Down"
             we_win    = (direction == outcome)
 
-            # Prix du token a l'entree (depuis price_history)
-            ph_market = ph_c[ph_c["market_id"] == market_id]
-            ph_entry  = ph_market[(ph_market["ts"] >= t_entry - 120) & (ph_market["ts"] <= t_entry + 120)]
-            tok_price = float(ph_entry["price"].iloc[0]) if not ph_entry.empty else None
+            # Prix token a l'entree
+            ph_m = ph_c[ph_c["market_id"] == market_id]
+            ph_e = ph_m[(ph_m["ts"] >= t_entry - 120) & (ph_m["ts"] <= t_entry + 120)]
+            tok  = float(ph_e["price"].iloc[0]) if not ph_e.empty else None
 
-            # Teste chaque gap
             for g in GAPS_PCT:
                 if gap_pct < g:
                     results[g]["skipped"] += 1
                     continue
-                if tok_price is not None and not (ENTRY_MIN <= tok_price <= ENTRY_MAX):
+                if tok is not None and not (ENTRY_MIN <= tok <= ENTRY_MAX):
                     results[g]["skipped"] += 1
                     continue
-                if we_win:
-                    results[g]["wins"] += 1
-                else:
-                    results[g]["losses"] += 1
+                results[g]["wins" if we_win else "losses"] += 1
 
             processed += 1
-            if processed % 200 == 0:
-                print(f"  Traite {processed} marches...")
+            if processed % 100 == 0:
+                print(f"  {processed} marches traites...")
 
-        except Exception:
+        except:
             continue
 
-    print(f"\nResultats {crypto} ({processed} marches traites):")
-    print(f"{'Gap %':>8} | {'Trades':>7} | {'Wins':>6} | {'Losses':>7} | {'Taux':>7} | {'Skip':>6}")
-    print("-" * 55)
-
-    best_gap  = None
-    best_rate = 0
+    print(f"\nResultats {crypto} ({processed} marches):")
+    print(f"{'Gap':>7} | {'Trades':>7} | {'Wins':>6} | {'Losses':>7} | {'Taux':>7}")
+    print("-" * 45)
+    best_gap, best_rate = None, 0
     for g in GAPS_PCT:
         r     = results[g]
         total = r["wins"] + r["losses"]
         rate  = (r["wins"] / total * 100) if total > 0 else 0
-        print(f"{g:>7}% | {total:>7} | {r['wins']:>6} | {r['losses']:>7} | {rate:>6.1f}% | {r['skipped']:>6}")
+        print(f"{g:>6}% | {total:>7} | {r['wins']:>6} | {r['losses']:>7} | {rate:>6.1f}%")
         if total >= 10 and rate > best_rate:
-            best_rate = rate
-            best_gap  = g
-
+            best_rate, best_gap = rate, g
     if best_gap:
-        print(f"\n  *** GAP OPTIMAL {crypto}: {best_gap}% ({best_rate:.1f}% reussite) ***")
-    final_results[crypto] = (best_gap, best_rate)
+        print(f"\n  *** OPTIMAL {crypto}: {best_gap}% ({best_rate:.1f}%) ***")
+    final[crypto] = (best_gap, best_rate)
 
 print("\n" + "="*50)
 print("RESUME FINAL")
 print("="*50)
-for crypto, (gap, rate) in final_results.items():
-    if gap:
-        print(f"  {crypto}: GAP_PCT = {gap}  ({rate:.1f}% de reussite)")
+for c, (g, r) in final.items():
+    if g:
+        print(f"  {c}: GAP_PCT = {g}  ({r:.1f}% reussite)")
     else:
-        print(f"  {crypto}: donnees insuffisantes")
-print("\nMets a jour Railway avec ces valeurs de GAP_PCT.")
+        print(f"  {c}: donnees insuffisantes")
