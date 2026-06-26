@@ -322,16 +322,41 @@ def settle_loop():
 
 
 # ============================================================
-# SCANNER GLOBAL : tous les marches actifs (sport, CdM, etc.)
-# Les marches peu surveilles gardent parfois Yes+No < 1 longtemps
+# ============================================================
+# SCANNER GLOBAL SPORT : marches sportifs actifs (CdM, foot, etc.)
+# Ameliorations :
+# 1. Scan toutes les 10s (au lieu de 60s) pour capter les pics de volatilite
+# 2. Filtre sport/foot uniquement (pas politique, pas crypto)
+# 3. Detection matchs en direct : priorite aux marches qui expirent dans <4h
 # ============================================================
 
-GLOBAL_SCAN_INTERVAL = int(os.getenv("ARB_GLOBAL_SCAN_INTERVAL", "60"))
-GLOBAL_MIN_DAYS_LEFT = 0      # marches qui se resolvent bientot acceptes
-GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))  # max 7 jours de blocage capital
+GLOBAL_SCAN_INTERVAL = int(os.getenv("ARB_GLOBAL_SCAN_INTERVAL", "10"))
+GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))
+
+# Mots-cles sport/foot pour filtrer uniquement les marches pertinents
+SPORT_KEYWORDS = [
+    "win", "goal", "match", "game", "score", "cup", "world",
+    "fifa", "soccer", "football", "league", "champion", "final",
+    "semi", "quarter", "group", "team", "player", "beat",
+    "coupe", "monde", "equipe", "gagner", "marquer",
+    # Equipes Coupe du Monde 2026
+    "france", "brazil", "argentina", "england", "spain", "germany",
+    "portugal", "morocco", "senegal", "ivory", "nigeria", "ghana",
+    "usa", "mexico", "japan", "korea", "australia", "croatia",
+]
+
+def is_sport_market(question):
+    """Retourne True si le marche est sportif."""
+    q = question.lower()
+    return any(kw in q for kw in SPORT_KEYWORDS)
+
+def is_live_match(end_ts):
+    """Retourne True si le marche expire dans moins de 4h (match en direct probable)."""
+    hours_left = (end_ts - time.time()) / 3600
+    return 0 < hours_left < 4
 
 def scan_global_markets():
-    """Scanne les marches actifs tries par volume, cherche Yes+No < seuil."""
+    """Scanne les marches sportifs actifs, cherche Yes+No < seuil."""
     found = []
     try:
         r = SESSION.get(GAMMA_API + "/markets",
@@ -342,14 +367,22 @@ def scan_global_markets():
             return found
         for m in r.json():
             try:
+                question  = m.get("question", "")
                 outcomes  = json.loads(m.get("outcomes", "[]")) \
                     if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
                 token_ids = json.loads(m.get("clobTokenIds", "[]")) \
                     if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
+
                 if len(outcomes) != 2 or len(token_ids) != 2:
                     continue
-                # date de fin : eviter de bloquer le capital trop longtemps
+
+                # FILTRE 1 : sport uniquement
+                if not is_sport_market(question):
+                    continue
+
+                # FILTRE 2 : date de fin (pas trop loin)
                 end = m.get("endDate") or m.get("end_date_iso")
+                end_ts = None
                 if end:
                     try:
                         end_ts = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp()
@@ -358,34 +391,45 @@ def scan_global_markets():
                             continue
                     except:
                         pass
+
                 a0, d0 = get_best_ask(token_ids[0])
                 a1, d1 = get_best_ask(token_ids[1])
                 if a0 is None or a1 is None:
                     continue
+
                 total = a0 + a1
                 if total <= SUM_MAX:
+                    live = is_live_match(end_ts) if end_ts else False
                     found.append({
-                        "question": m.get("question", "?")[:60],
+                        "question": question[:60],
                         "t0": token_ids[0], "p0": a0, "d0": d0,
                         "t1": token_ids[1], "p1": a1, "d1": d1,
                         "total": total,
+                        "live": live,  # match en direct = priorite
                     })
             except Exception:
                 continue
+
+        # Trie : matchs en direct d'abord, puis par somme la plus basse
+        found.sort(key=lambda x: (not x["live"], x["total"]))
+
     except Exception as e:
         log.error("Scan global: " + str(e))
     return found
 
 def global_scan_loop():
-    log.info("Scanner global demarre (sport/CdM/tous marches) - toutes les "
-             + str(GLOBAL_SCAN_INTERVAL) + "s")
+    log.info("Scanner global SPORT demarre - toutes les "
+             + str(GLOBAL_SCAN_INTERVAL) + "s"
+             + " | filtre: foot/sport | live match prioritaire")
     global daily_pnl
     while True:
         try:
             if daily_pnl > -STOP_LOSS_USDC:
                 opps = scan_global_markets()
                 for o in opps:
-                    log.info("[GLOBAL] OPPORTUNITE | " + o["question"]
+                    live_tag = " [LIVE]" if o.get("live") else ""
+                    log.info("[GLOBAL" + live_tag + "] OPPORTUNITE | "
+                             + o["question"]
                              + " | somme " + str(round(o["total"], 3))
                              + " | profondeur " + str(round(min(o["d0"], o["d1"]), 1)))
                     with arbs_lock:
@@ -405,7 +449,6 @@ def global_scan_loop():
                                 "market":   "GLOBAL",
                                 "sum_paid": round(o["p0"] + o["p1"] + 0.02, 4),
                                 "shares":   shares,
-                                # regle a la resolution : on garde 7 jours max en memoire
                                 "expiry":   int(time.time()) + 7 * 86400,
                             })
         except Exception as e:
