@@ -19,7 +19,8 @@ WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 SUM_MAX        = float(os.getenv("ARB_SUM_MAX", "0.97"))
 
 # Capital par trade (sur CHAQUE arbitrage, les deux jambes comprises)
-TRADE_USDC     = float(os.getenv("ARB_TRADE_USDC", "10"))
+TRADE_USDC        = float(os.getenv("ARB_TRADE_USDC", "10"))
+GLOBAL_TRADE_USDC = float(os.getenv("ARB_GLOBAL_TRADE_USDC", "10"))  # mise sport separee
 
 # Nombre max d'arbitrages simultanes en attente d'expiration
 MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT", "3"))
@@ -358,6 +359,7 @@ def is_live_match(end_ts):
 def scan_global_markets():
     """Scanne les marches sportifs actifs, cherche Yes+No < seuil."""
     found = []
+    n_sport = 0
     try:
         r = SESSION.get(GAMMA_API + "/markets",
                         params={"active": "true", "closed": "false",
@@ -379,6 +381,7 @@ def scan_global_markets():
                 # FILTRE 1 : sport uniquement
                 if not is_sport_market(question):
                     continue
+                n_sport += 1
 
                 # FILTRE 2 : date de fin (pas trop loin)
                 end = m.get("endDate") or m.get("end_date_iso")
@@ -413,6 +416,10 @@ def scan_global_markets():
         # Trie : matchs en direct d'abord, puis par somme la plus basse
         found.sort(key=lambda x: (not x["live"], x["total"]))
 
+        # Log debug : combien de marches sport scannés
+        log.info("[GLOBAL] " + str(len(found)) + " marche(s) sport < seuil | "
+                 + str(n_sport) + " marches sport vus au total")
+
     except Exception as e:
         log.error("Scan global: " + str(e))
     return found
@@ -436,7 +443,7 @@ def global_scan_loop():
                         n = len(open_arbs)
                     if n >= MAX_CONCURRENT:
                         continue
-                    shares_cap   = math.floor(TRADE_USDC / o["total"] * 100) / 100
+                    shares_cap   = math.floor(GLOBAL_TRADE_USDC / o["total"] * 100) / 100
                     shares_depth = math.floor(min(o["d0"], o["d1"]) * 100) / 100
                     shares       = min(shares_cap, shares_depth)
                     if shares < 1:
