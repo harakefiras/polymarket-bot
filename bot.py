@@ -39,7 +39,7 @@ CIRCUIT_BREAKER_PAUSE  = int(os.getenv("CIRCUIT_BREAKER_PAUSE",  "7200"))
 # 50$ donne un signal plus fiable sur 5 minutes
 GAP_MIN          = float(os.getenv("GAP_MIN",          "50"))
 # Gap dynamique : % du prix BTC, recalcule a chaque fenetre (0 = desactive, utilise GAP_MIN fixe)
-GAP_PCT          = float(os.getenv("GAP_PCT",          "0.10"))
+GAP_PCT          = float(os.getenv("GAP_PCT",          "0.09"))
 
 # Fourchette d'entree resserree : on plafonne a 0.65 (au lieu de 0.75)
 # Acheter a 0.75 = gain max limité, perte max totale → mauvais rapport
