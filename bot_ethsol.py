@@ -48,6 +48,9 @@ MARKETS = {
         "coinbase": "https://api.coinbase.com/v2/prices/ETH-USD/spot",
         "gap":      float(os.getenv("ETH_GAP_MIN", "8")),
         "gap_pct":  float(os.getenv("ETH_GAP_PCT", "0.09")),
+        "dyn_factor": float(os.getenv("DYN_VOL_FACTOR", "0.5")),
+        "dyn_min":    float(os.getenv("ETH_DYN_GAP_MIN", "3")),
+        "dyn_max":    float(os.getenv("ETH_DYN_GAP_MAX", "50")),
         "deviation": float(os.getenv("ETH_DEVIATION", "50")),
         "entry_min": float(os.getenv("ETH_ENTRY_PRICE_MIN", "0.52")),
         "entry_max": float(os.getenv("ETH_ENTRY_PRICE_MAX", "0.68")),
@@ -57,6 +60,9 @@ MARKETS = {
         "coinbase": "https://api.coinbase.com/v2/prices/SOL-USD/spot",
         "gap":      float(os.getenv("SOL_GAP_MIN", "3")),
         "gap_pct":  float(os.getenv("SOL_GAP_PCT", "0.09")),
+        "dyn_factor": float(os.getenv("DYN_VOL_FACTOR", "0.5")),
+        "dyn_min":    float(os.getenv("SOL_DYN_GAP_MIN", "0.3")),
+        "dyn_max":    float(os.getenv("SOL_DYN_GAP_MAX", "5")),
         "deviation": float(os.getenv("SOL_DEVIATION", "10")),
         "entry_min": float(os.getenv("SOL_ENTRY_PRICE_MIN", "0.52")),
         "entry_max": float(os.getenv("SOL_ENTRY_PRICE_MAX", "0.68")),
@@ -175,6 +181,18 @@ def load_strikes(market):
         pass
     return s
 
+
+def get_dynamic_gap_seuil_market(market, price_now):
+    """Calcule le seuil dynamique pour ETH ou SOL."""
+    cfg = MARKETS[market]
+    hist = state[market]["gap_history"]
+    if len(hist) < 3:
+        return price_now * cfg.get("gap_pct", 0.09) / 100
+    vol_moy = sum(hist) / len(hist)
+    seuil   = vol_moy * cfg["dyn_factor"]
+    seuil   = max(cfg["dyn_min"], min(cfg["dyn_max"], seuil))
+    return seuil
+
 def save_strike(market, window_ts, price):
     try:
         with open(FILES[market]["strikes"], "a") as fp:
@@ -192,6 +210,7 @@ state = {
         "pnl_date":           date.today(),
         "traded_windows":     load_traded_windows(m),
         "strikes":            load_strikes(m),
+                "gap_history":        [],   # historique volatilite reelle
         "open_positions":     [],
         "consecutive_losses": 0,
         "circuit_breaker_until": 0,
@@ -618,10 +637,12 @@ def run():
                     strike      = s["strikes"][window_ts]
                     price_now   = get_price(market)
                     gap         = price_now - strike
-
-                    gap_pct   = cfg.get("gap_pct", 0)
-                    gap_seuil = (price_now * gap_pct / 100) if gap_pct > 0 else cfg["gap"]
-                    if abs(gap) >= gap_seuil:
+                    gap_abs     = abs(gap)
+                    # Enregistre dans l'historique de volatilite
+                    s["gap_history"].append(gap_abs)
+                    s["gap_history"] = s["gap_history"][-10:]
+                    gap_seuil   = get_dynamic_gap_seuil_market(market, price_now)
+                    if gap_abs >= gap_seuil:
                         target_outcome = "Up" if gap > 0 else "Down"
                         log.info("[" + market + "] Gap "
                                  + str(round(gap, 2)) + "$ | "
