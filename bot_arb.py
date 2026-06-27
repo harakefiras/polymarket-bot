@@ -224,36 +224,69 @@ async def execute_arb_async(up_id, up_px, down_id, down_px,
                 log.warning("[" + market_key + "] Aucune jambe executee - abandon")
                 return False, 0
 
-            # Attente courte puis verification des deux jambes
-            await asyncio.sleep(8)
+            # Verification reelle des positions dans le wallet
+            # On attend 5s puis on verifie via GET /positions (pas les ordres ouverts)
+            await asyncio.sleep(5)
 
-            filled = {"up": ok_up, "down": ok_down}
+            filled = {"up": False, "down": False}
             try:
-                open_orders = None
-                for meth in ("get_orders", "get_open_orders"):
-                    fn = getattr(client, meth, None)
-                    if fn:
-                        open_orders = await fn()
-                        break
-                if open_orders is not None:
-                    items = getattr(open_orders, "orders", open_orders)
-                    ids = []
-                    if isinstance(items, list):
-                        for o in items:
-                            oid = o.get("id") if isinstance(o, dict) \
-                                else getattr(o, "id", None)
-                            ids.append(oid)
-                    cancel = getattr(client, "cancel_order", None)
-                    if oid_up and oid_up in ids:
-                        filled["up"] = False
-                        if cancel:
-                            await cancel(order_id=oid_up)
-                    if oid_down and oid_down in ids:
-                        filled["down"] = False
-                        if cancel:
-                            await cancel(order_id=oid_down)
+                # Verification via positions reelles dans le wallet
+                import aiohttp
+                headers = {"Authorization": "Bearer " + CLOB_API_KEY} \
+                    if "CLOB_API_KEY" in globals() and CLOB_API_KEY else {}
+                
+                async def get_position_size(token_id):
+                    """Recupere le solde reel du token dans le wallet via CLOB API."""
+                    url = "https://clob.polymarket.com/positions"
+                    try:
+                        async with aiohttp.ClientSession() as s:
+                            async with s.get(url,
+                                    params={"user": WALLET},
+                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                                if resp.status == 200:
+                                    data = await resp.json()
+                                    positions = data if isinstance(data, list) \
+                                        else data.get("positions", [])
+                                    for pos in positions:
+                                        tid = pos.get("asset_id") or pos.get("token_id", "")
+                                        if str(tid) == str(token_id):
+                                            size = float(pos.get("size", 0))
+                                            return size
+                    except Exception:
+                        pass
+                    return 0.0
+
+                size_up   = await get_position_size(up_id)
+                size_down = await get_position_size(down_id)
+
+                filled["up"]   = size_up   >= shares * 0.9   # tolerance 10%
+                filled["down"] = size_down >= shares * 0.9
+
+                log.info("[" + market_key + "] Verif positions | UP: "
+                         + str(round(size_up, 2)) + " shares | DOWN: "
+                         + str(round(size_down, 2)) + " shares | attendu: "
+                         + str(shares))
+
+                # Annule les ordres ouverts non executes
+                cancel = getattr(client, "cancel_order", None)
+                if not filled["up"] and oid_up and cancel:
+                    try:
+                        await cancel(order_id=oid_up)
+                        log.warning("[" + market_key + "] Ordre UP annule (non execute)")
+                    except Exception:
+                        pass
+                if not filled["down"] and oid_down and cancel:
+                    try:
+                        await cancel(order_id=oid_down)
+                        log.warning("[" + market_key + "] Ordre DOWN annule (non execute)")
+                    except Exception:
+                        pass
+
             except Exception as ve:
-                log.warning("Verif jambes impossible: " + str(ve))
+                log.warning("Verif positions impossible: " + str(ve))
+                # Fallback : si verification impossible, on se fie a ok_up/ok_down
+                filled["up"]   = ok_up
+                filled["down"] = ok_down
 
             # Cas 1 : les deux jambes tenues -> arbitrage verrouille
             if filled["up"] and filled["down"]:
