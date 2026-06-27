@@ -444,7 +444,7 @@ def monitor_loop():
             for market in MARKETS:
                 s = state[market]
                 with positions_lock:
-                    positions_copy = list(s["open_positions"])
+                    positions_copy = [p for p in s["open_positions"] if not p.get("sold")]
                 if not positions_copy:
                     continue
 
@@ -476,6 +476,7 @@ def monitor_loop():
                                         + " | Total: "
                                         + str(round(s["daily_pnl"], 2)))
                             to_remove.append((market, pos))
+                            pos["sold"] = True  # evite double vente
                         continue
                     pos["zero_count"] = 0
 
@@ -497,6 +498,7 @@ def monitor_loop():
                         log.info("[" + market + "] Expire PERTE "
                                  + str(round(pnl, 2)))
                         to_remove.append((market, pos))
+                        pos["sold"] = True  # evite double vente
 
                     # 2. Marché expiré en gain
                     elif current >= 0.98:
@@ -508,6 +510,7 @@ def monitor_loop():
                                  + str(round(pnl, 2))
                                  + " | Total: " + str(round(s["daily_pnl"], 2)))
                         to_remove.append((market, pos))
+                        pos["sold"] = True  # evite double vente
 
                     # 3. TAKE PROFIT : +40% de gain par rapport a l'entree
                     elif current >= entry * (1 + TAKE_PROFIT_GAIN):
@@ -520,6 +523,7 @@ def monitor_loop():
                                      + str(round(pnl, 2))
                                      + " | Total: " + str(round(s["daily_pnl"], 2)))
                             to_remove.append((market, pos))
+                            pos["sold"] = True  # evite double vente
 
                     # 4. Stop loss : valeur position < mise * (1 - 30%)
                     elif current * shares <= pos["size"] * (1 - STOP_LOSS_PCT):
@@ -532,6 +536,7 @@ def monitor_loop():
                             save_daily_pnl(market, s["daily_pnl"])
                             record_loss(market)
                             to_remove.append((market, pos))
+                            pos["sold"] = True  # evite double vente
 
                     # 6. 3 DERNIERES MINUTES : si en perte -> vente forcee SYSTEMATIQUE
                     elif (pos.get("window_ts", 0) > 0
@@ -547,6 +552,7 @@ def monitor_loop():
                             log.info("[" + market + "] FORCE_FIN "
                                      + str(round(pnl, 2)))
                             to_remove.append((market, pos))
+                            pos["sold"] = True  # evite double vente
 
                 # Nettoyage des positions soldées
                 if to_remove:
