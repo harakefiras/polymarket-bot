@@ -462,6 +462,7 @@ def monitor_loop():
                                     + str(round(pnl, 2)) + " | Total: "
                                     + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
+                        pos["sold"] = True  # evite double vente
                     continue
                 pos["zero_count"] = 0
 
@@ -483,6 +484,7 @@ def monitor_loop():
                     save_daily_pnl(daily_pnl)
                     record_loss()
                     to_remove.append(pos)
+                    pos["sold"] = True  # evite double vente
 
                 # 2. Marche expire en gain
                 elif current >= 0.98:
@@ -494,6 +496,7 @@ def monitor_loop():
                     log.info("PnL: +" + str(round(pnl, 2))
                              + " | Total: " + str(round(daily_pnl, 2)))
                     to_remove.append(pos)
+                    pos["sold"] = True  # evite double vente
 
                 # 3. TAKE PROFIT : +40% de gain par rapport a l'entree
                 elif current >= entry * (1 + TAKE_PROFIT_GAIN):
@@ -506,6 +509,7 @@ def monitor_loop():
                         log.info("PnL TP: +" + str(round(pnl, 2))
                                  + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
+                        pos["sold"] = True  # evite double vente
 
                 # 4. Stop loss : valeur position < mise * (1 - 30%)
                 elif current * shares <= pos["size"] * (1 - STOP_LOSS_PCT):
@@ -518,6 +522,7 @@ def monitor_loop():
                         save_daily_pnl(daily_pnl)
                         record_loss()
                         to_remove.append(pos)
+                        pos["sold"] = True
 
                 # 6. DERNIERE MINUTE (240s) : si en perte -> vente forcee SYSTEMATIQUE
                 elif (pos.get("window_ts", 0) > 0
@@ -533,6 +538,7 @@ def monitor_loop():
                         log.info("PnL: " + str(round(pnl, 2))
                                  + " | Total: " + str(round(daily_pnl, 2)))
                         to_remove.append(pos)
+                        pos["sold"] = True  # marque vendue immediatement
 
             # Nettoyage des positions soldees
             if to_remove:
