@@ -37,8 +37,14 @@ CIRCUIT_BREAKER_PAUSE  = int(os.getenv("CIRCUIT_BREAKER_PAUSE",  "7200"))
 # Strategie prix a battre
 # Gap reduit a 50$ (au lieu de 30$) : 30$ c'est du bruit sur BTC,
 # 50$ donne un signal plus fiable sur 5 minutes
+# Gap DYNAMIQUE base sur la volatilite reelle des dernieres fenetres
+# Nouvelles variables (n'entrent pas en conflit avec GAP_PCT/GAP_MIN existantes)
+DYN_VOL_WINDOWS  = int(float(os.getenv("DYN_VOL_WINDOWS",  "10")))   # nb fenetres historiques
+DYN_VOL_FACTOR   = float(os.getenv("DYN_VOL_FACTOR",   "0.5"))       # seuil = VOL_FACTOR * volatilite_moy
+DYN_GAP_MIN      = float(os.getenv("DYN_GAP_MIN",      "20"))        # plancher absolu en $
+DYN_GAP_MAX      = float(os.getenv("DYN_GAP_MAX",      "200"))       # plafond absolu en $
+# Garde les anciennes variables pour compatibilite Railway (non utilisees si DYN actif)
 GAP_MIN          = float(os.getenv("GAP_MIN",          "50"))
-# Gap dynamique : % du prix BTC, recalcule a chaque fenetre (0 = desactive, utilise GAP_MIN fixe)
 GAP_PCT          = float(os.getenv("GAP_PCT",          "0.09"))
 
 # Fourchette d'entree resserree : on plafonne a 0.65 (au lieu de 0.75)
@@ -141,7 +147,24 @@ def save_traded_window(window_ts):
     except:
         pass
 
-strikes = {}
+strikes        = {}
+gap_history    = []   # historique des gaps absolus des dernieres fenetres
+
+def add_gap_history(gap_abs):
+    """Ajoute un gap observe a l'historique et calcule le seuil dynamique."""
+    global gap_history
+    gap_history.append(gap_abs)
+    gap_history = gap_history[-DYN_VOL_WINDOWS:]  # garde les N dernieres
+
+def get_dynamic_gap_seuil(btc_now):
+    """Calcule le seuil de gap dynamique base sur la volatilite recente."""
+    if len(gap_history) < 3:
+        # Pas assez d'historique : utilise 0.09% du prix
+        return btc_now * 0.09 / 100
+    vol_moy = sum(gap_history) / len(gap_history)
+    seuil   = vol_moy * DYN_VOL_FACTOR
+    seuil   = max(DYN_GAP_MIN, min(DYN_GAP_MAX, seuil))
+    return seuil
 
 def load_strikes():
     try:
@@ -536,7 +559,7 @@ def run():
         pass
 
     log.info("Bot Polymarket v9 - Prix a Battre - BTC via Coinbase")
-    log.info("Gap: " + str(GAP_MIN) + "$ | Entree: "
+    log.info("Gap dynamique: " + str(round(get_dynamic_gap_seuil(60000), 1)) + "$ (vol moy: " + str(round(sum(gap_history)/max(1,len(gap_history)),1)) + "$) | Entree: "
              + str(ENTRY_PRICE_MIN) + "-" + str(ENTRY_PRICE_MAX)
              + " | SL jour: " + str(STOP_LOSS_USDC)
              + "$ | TP jour: " + str(DAILY_TAKE_PROFIT) + "$")
@@ -611,11 +634,12 @@ def run():
 
                 strike  = strikes[window_ts]
                 btc_now = get_btc_price()
-                gap     = btc_now - strike
-                # Gap dynamique : 0.08% du prix actuel (fallback GAP_MIN si GAP_PCT=0)
-                gap_seuil = (btc_now * GAP_PCT / 100) if GAP_PCT > 0 else GAP_MIN
+                gap       = btc_now - strike
+                gap_abs   = abs(gap)
+                add_gap_history(gap_abs)   # enregistre la volatilite observee
+                gap_seuil = get_dynamic_gap_seuil(btc_now)
 
-                if abs(gap) >= gap_seuil:
+                if gap_abs >= gap_seuil:
                     target_outcome = "Up" if gap > 0 else "Down"
                     log.info("Gap " + str(round(gap, 1)) + "$ | "
                              + target_outcome + " | BTC: "
