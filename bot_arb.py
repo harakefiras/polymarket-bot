@@ -1,656 +1,438 @@
-import os, time, logging, requests, json, asyncio, math
+"""
+BOT ARBITRAGE YES+NO v2 - corrige et mesurable
+==============================================
+Principe (inchange, et c'est le seul des 4 bots avec un vrai edge potentiel) :
+  quand ask(Up) + ask(Down) < 1, acheter LES DEUX cotes ; a l'expiration
+  l'un vaut 1.00, donc gain = 1 - somme_payee, sans pari directionnel.
+
+CE QUE LA v1 FAISAIT MAL (et qui a produit le faux "8.87") :
+  - confirmation de fill basee sur un snapshot /positions a +5s, en plus
+    NON AUTHENTIFIE (CLOB_API_KEY n'existait pas) -> renvoyait vide ->
+    le bot croyait "rien execute", annulait dans le vide, et laissait une
+    jambe ORPHELINE non revendue. Le gain venait du hasard (la jambe seule
+    gagnait), pas de l'arbitrage.
+  - taille calculee sur le MEILLEUR ask seulement : l'arb affiche a 0.97
+    n'existe que sur 2-3 shares ; en taille reelle la somme repasse > 1.
+  - achat a px+0.01 -> on paie plus que le prix affiche -> l'edge de 3%
+    est mange avant meme les frais.
+
+CE QUE LA v2 CORRIGE :
+  1. FILL REEL : on interroge le STATUT de chaque ordre (size_matched) avec
+     retry, via le client authentifie. Jamais un snapshot /positions, jamais
+     un DELETE 200 pris pour "non execute".
+  2. ORPHELINE : si une seule jambe remplit, on revend l'orpheline tout de
+     suite et on compte la VRAIE perte (pas une estimation 0.05).
+  3. TAILLE REELLE : on "marche le carnet" sur les deux cotes pour la taille
+     visee, on calcule la somme EFFECTIVE (slippage inclus), et on n'entre
+     que si cette somme effective passe encore sous le seuil.
+
+MODE OBSERVATION (OBSERVE_ONLY=true, defaut) :
+  le bot scanne, calcule pour chaque "opportunite" combien elle survit EN
+  TAILLE REELLE, et le PnL qu'il AURAIT verrouille - sans passer aucun ordre.
+  Apres 2-3 jours tu sauras si l'arb a un edge reel ou s'il n'existe qu'a
+  l'ecran. Passe OBSERVE_ONLY=false seulement si les chiffres sont positifs.
+
+Variables d'env :
+  OBSERVE_ONLY      = true     <-- garde 'true' tant que pas mesure
+  ARB_SUM_MAX       = 0.97
+  ARB_TRADE_USDC    = 10
+  ARB_MAX_CONCURRENT= 3
+  ARB_MIN_TIME_LEFT = 60
+  ARB_SCAN_INTERVAL = 1
+  ARB_ENABLE_SPORT  = false    <-- scanner sport DESACTIVE par defaut (dangereux)
+  OBS_FILE          = arb_observe.jsonl   (mets un volume Railway !)
+"""
+
+import os, sys, time, json, math, logging, threading, asyncio
 from datetime import date, datetime, timezone
-import threading
 
-# ============================================================
-# BOT ARBITRAGE YES+NO - POLYMARKET MARCHES COURTS
-# Principe : quand ask(Up) + ask(Down) < 1$ (ex: 0.97),
-# on achete LES DEUX cotes. A l'expiration, l'un vaut 1.00.
-# Gain garanti = 1.00 - somme payee, SANS pari directionnel.
-# Risque unique : jambe orpheline (un seul cote execute)
-# -> gere par verification + revente immediate.
-# ============================================================
+import requests
+SESSION = requests.Session()
 
-PRIVATE_KEY = os.environ.get("PRIVATE_KEY", "")
-WALLET      = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(message)s", stream=sys.stdout)
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
+log = logging.getLogger("arb")
 
-# Seuil d'arbitrage : somme max payee pour les deux cotes
-# 0.97 = 3% de gain brut minimum (couvre les frais ~2%)
-SUM_MAX        = float(os.getenv("ARB_SUM_MAX", "0.97"))
+# ------------------------- Config -------------------------
+PRIVATE_KEY  = os.environ.get("PRIVATE_KEY", "")
+WALLET       = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
-# Capital par trade (sur CHAQUE arbitrage, les deux jambes comprises)
-TRADE_USDC        = float(os.getenv("ARB_TRADE_USDC", "10"))
-GLOBAL_TRADE_USDC = float(os.getenv("ARB_GLOBAL_TRADE_USDC", "10"))  # mise sport separee
+OBSERVE_ONLY = os.getenv("OBSERVE_ONLY", "true").lower() != "false"
+SUM_MAX      = float(os.getenv("ARB_SUM_MAX",        "0.97"))
+TRADE_USDC   = float(os.getenv("ARB_TRADE_USDC",     "10"))
+MAX_CONCUR   = int(os.getenv("ARB_MAX_CONCURRENT",   "3"))
+MIN_TIME_LEFT= int(os.getenv("ARB_MIN_TIME_LEFT",    "60"))
+SCAN_INTERVAL= float(os.getenv("ARB_SCAN_INTERVAL",  "1"))
+ENABLE_SPORT = os.getenv("ARB_ENABLE_SPORT", "false").lower() == "true"
+OBS_FILE     = os.getenv("OBS_FILE", "arb_observe.jsonl")
+STOP_LOSS    = float(os.getenv("ARB_STOP_LOSS_USDC", "10"))
 
-# Nombre max d'arbitrages simultanes en attente d'expiration
-MAX_CONCURRENT = int(os.getenv("ARB_MAX_CONCURRENT", "3"))
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API  = "https://clob.polymarket.com"
 
-# Stop si les pertes du jour (jambes orphelines) depassent ce seuil
-STOP_LOSS_USDC = float(os.getenv("ARB_STOP_LOSS_USDC", "10"))
-
-# Ne pas entrer dans les X dernieres secondes d'une fenetre
-# (le temps que les deux jambes s'executent)
-MIN_TIME_LEFT  = int(os.getenv("ARB_MIN_TIME_LEFT", "60"))
-
-# Frequence de scan (secondes) - rapide, les fenetres durent peu
-SCAN_INTERVAL  = float(os.getenv("ARB_SCAN_INTERVAL", "1"))
-
-# Plage horaire active (UTC)
-ACTIVE_HOURS = list(range(int(os.getenv("ARB_HOUR_START", "0")),
-                          int(os.getenv("ARB_HOUR_END",   "24"))))
-
-# Marches scannes : slug + duree de fenetre en secondes
 MARKETS = {
     "BTC5":  {"slug": "btc-updown-5m-",  "window": 300},
     "ETH15": {"slug": "eth-updown-15m-", "window": 900},
     "SOL15": {"slug": "sol-updown-15m-", "window": 900},
 }
 
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API  = "https://clob.polymarket.com"
-
-PNL_FILE     = "/app/arb_daily_pnl.txt"
-PNL_HISTORY  = "/app/arb_pnl_history.txt"  # historique cumul 2 semaines
-
-SESSION = requests.Session()
-
-import sys
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s %(message)s", stream=sys.stdout)
-try:
-    sys.stdout.reconfigure(line_buffering=True)
-except:
-    pass
-log = logging.getLogger("arb")
-
-# ============================================================
-# MEMOIRE PERSISTANTE
-# ============================================================
-
-def load_daily_pnl():
-    try:
-        if os.path.exists(PNL_FILE):
-            with open(PNL_FILE, "r") as f:
-                lines = f.read().strip().split("\n")
-                if len(lines) == 2 and lines[0] == str(date.today()):
-                    return float(lines[1])
-        return 0.0
-    except:
-        return 0.0
-
-def save_daily_pnl(pnl):
-    try:
-        with open(PNL_FILE, "w") as f:
-            f.write(str(date.today()) + "\n" + str(round(pnl, 4)))
-    except:
-        pass
-
-def append_pnl_history(day, pnl):
-    """Ajoute une ligne dans l historique quotidien (2 semaines)."""
-    try:
-        # Charge l historique existant
-        lines = []
-        if os.path.exists(PNL_HISTORY):
-            with open(PNL_HISTORY, "r") as f:
-                lines = [l.strip() for l in f if l.strip()]
-        # Evite les doublons sur la meme date
-        lines = [l for l in lines if not l.startswith(str(day))]
-        lines.append(str(day) + " | " + str(round(pnl, 4)) + "$")
-        # Garde les 14 derniers jours max
-        lines = lines[-14:]
-        with open(PNL_HISTORY, "w") as f:
-            f.write("\n".join(lines) + "\n")
-    except Exception as e:
-        log.warning("Historique PnL: " + str(e))
-
-daily_pnl   = load_daily_pnl()
-pnl_date    = date.today()
-open_arbs   = []      # arbitrages en attente d'expiration
+# Etat
+daily_pnl   = 0.0
+open_arbs   = []
 arbs_lock   = threading.Lock()
-done_windows = set()  # fenetres deja arbitrees (cle market+ts)
+done_windows = set()
+# compteurs observation
+obs_seen = 0
+obs_executable = 0
+obs_hypo_pnl = 0.0
 
-# ============================================================
-# DONNEES MARCHE
-# ============================================================
+# ------------------------- Carnet -------------------------
+def get_asks(token_id):
+    """Retourne la liste triee [(prix, taille), ...] du cote ASK, ou []."""
+    try:
+        r = SESSION.get(CLOB_API + "/book",
+                        params={"token_id": token_id}, timeout=8)
+        if not r.ok:
+            return []
+        asks = r.json().get("asks", [])
+        out = [(float(a["price"]), float(a["size"])) for a in asks]
+        out.sort(key=lambda x: x[0])      # du moins cher au plus cher
+        return out
+    except Exception:
+        return []
 
-def get_market_tokens(slug_prefix, window_ts):
-    """Retourne [{outcome, token_id}] pour la fenetre donnee."""
+def walk_book(asks, shares_wanted):
+    """
+    Cout reel pour acheter 'shares_wanted' en consommant le carnet niveau
+    par niveau. Retourne (prix_moyen_effectif, shares_remplissables).
+    C'est LA correction cle : on ne suppose plus que tout se fait au meilleur ask.
+    """
+    if shares_wanted <= 0 or not asks:
+        return None, 0.0, None
+    remaining = shares_wanted
+    cost = 0.0
+    filled = 0.0
+    worst_px = asks[0][0]
+    for px, size in asks:
+        take = min(remaining, size)
+        cost += take * px
+        filled += take
+        remaining -= take
+        worst_px = px
+        if remaining <= 1e-9:
+            break
+    if filled <= 0:
+        return None, 0.0, None
+    return cost / filled, filled, worst_px
+
+def best_executable(asks_up, asks_down, capital, sum_max):
+    """
+    Cherche la taille reelle de l'arb : on vise la taille permise par le
+    capital, puis on regarde si la somme EFFECTIVE (slippage des deux cotes)
+    passe sous le seuil et combien de shares sont reellement disponibles.
+    Retourne un dict de mesure (sans rien executer).
+    """
+    if not asks_up or not asks_down:
+        return None
+    best_up, best_down = asks_up[0][0], asks_down[0][0]
+    best_sum = best_up + best_down
+    target = math.floor(capital / max(best_sum, 1e-6) * 100) / 100
+    if target < 1:
+        target = 1.0
+    avg_up, fill_up, worst_up = walk_book(asks_up, target)
+    avg_down, fill_down, worst_down = walk_book(asks_down, target)
+    if avg_up is None or avg_down is None:
+        return None
+    fillable = min(fill_up, fill_down)
+    eff_sum = avg_up + avg_down
+    executable = (eff_sum <= sum_max) and (fillable >= 1.0)
+    hypo_pnl = (1.0 - eff_sum) * min(target, fillable) if executable else 0.0
+    return {
+        "best_up": best_up, "best_down": best_down, "best_sum": best_sum,
+        "target": target, "avg_up": avg_up, "avg_down": avg_down,
+        "eff_sum": eff_sum, "fill_up": fill_up, "fill_down": fill_down,
+        "fillable": fillable, "worst_up": worst_up, "worst_down": worst_down,
+        "executable": executable, "hypo_pnl": hypo_pnl,
+    }
+
+# ------------------------- Marche -------------------------
+def get_tokens(slug_prefix, window_ts):
     try:
         slug = slug_prefix + str(window_ts)
         r = SESSION.get(GAMMA_API + "/markets",
-                         params={"slug": slug}, timeout=8)
+                        params={"slug": slug}, timeout=8)
         if r.ok:
             data = r.json()
-            m = data[0] if isinstance(data, list) and len(data) > 0 else None
+            m = data[0] if isinstance(data, list) and data else None
             if m and m.get("slug") == slug:
-                outcomes  = json.loads(m.get("outcomes", "[]")) \
-                    if isinstance(m.get("outcomes"), str) \
-                    else m.get("outcomes", [])
-                token_ids = json.loads(m.get("clobTokenIds", "[]")) \
-                    if isinstance(m.get("clobTokenIds"), str) \
-                    else m.get("clobTokenIds", [])
-                return [{"outcome": outcomes[i], "token_id": token_ids[i]}
-                        for i in range(len(outcomes))]
-        return None
-    except:
-        return None
+                oc = m.get("outcomes")
+                oc = json.loads(oc) if isinstance(oc, str) else (oc or [])
+                tk = m.get("clobTokenIds")
+                tk = json.loads(tk) if isinstance(tk, str) else (tk or [])
+                if len(oc) == 2 and len(tk) == 2:
+                    return [{"outcome": oc[i], "token_id": tk[i]}
+                            for i in range(2)]
+    except Exception:
+        pass
+    return None
 
-def get_best_ask(token_id):
-    """Lit le carnet d'ordres : meilleur prix d'achat dispo + profondeur."""
+# ------------------------- Execution reelle (OBSERVE_ONLY=false) -------------------------
+async def confirm_fill(client, order_id, want):
+    """
+    Confirme l'execution REELLE : on lit le statut de l'ORDRE (size_matched)
+    avec retry. PAS un snapshot /positions. Renvoie shares remplies.
+    NB : adapte 'get_order' / champs au SDK polymarket si besoin.
+    """
+    if not order_id:
+        return 0.0
+    for _ in range(8):
+        try:
+            od = await client.get_order(order_id)
+            status = (od.get("status") or "").upper()
+            filled = float(od.get("size_matched", 0) or 0)
+            if status in ("MATCHED", "FILLED") or filled >= want - 1e-9:
+                return filled
+            if status in ("CANCELED", "CANCELLED") and filled == 0:
+                return 0.0
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)
+    # derniere lecture best-effort
     try:
-        r = SESSION.get(CLOB_API + "/book",
-                         params={"token_id": token_id}, timeout=8)
-        if r.ok:
-            book = r.json()
-            asks = book.get("asks", [])
-            if asks:
-                # asks tries du moins cher au plus cher selon l'API ;
-                # on prend le meilleur (prix le plus bas)
-                best = min(asks, key=lambda a: float(a["price"]))
-                return float(best["price"]), float(best["size"])
-        return None, 0
-    except:
-        return None, 0
+        od = await client.get_order(order_id)
+        return float(od.get("size_matched", 0) or 0)
+    except Exception:
+        return 0.0
 
-def get_token_price(token_id):
+async def buy_leg(client, token_id, limit_px, shares):
     try:
-        r = SESSION.get(CLOB_API + "/last-trade-price",
-                         params={"token_id": token_id}, timeout=8)
-        if r.ok:
-            return float(r.json().get("price", 0))
-        return 0
-    except:
-        return 0
-
-# ============================================================
-# ORDRES
-# ============================================================
-
-async def buy_leg(client, token_id, px, shares):
-    """Achete une jambe. Retourne (ok, order_id)."""
-    try:
-        response = await client.place_limit_order(
+        resp = await client.place_limit_order(
             token_id=token_id, side="BUY",
-            price=str(round(px, 4)), size=str(shares))
-        if response.ok:
-            oid = getattr(response, "order_id", None) \
-                or getattr(response, "id", None)
-            return True, oid
-        log.error("Echec jambe: " + str(response.message))
-        return False, None
+            price=str(round(limit_px, 4)), size=str(shares))
+        if resp.ok:
+            return getattr(resp, "order_id", None) or getattr(resp, "id", None)
     except Exception as e:
-        log.error("Exception jambe: " + str(e))
-        return False, None
+        log.error("buy_leg: " + str(e))
+    return None
 
-async def sell_leg(client, token_id, shares, px):
-    """Revend une jambe orpheline, agressivement (px - 0.04)."""
+async def sell_orphan(client, token_id, shares, ref_px):
+    """Revend une jambe orpheline immediatement, agressivement."""
     try:
-        sell_px = max(0.01, round(px - 0.04, 4))
-        shares_safe = max(0.01, round(shares - 0.01, 2))
-        response = await client.place_limit_order(
+        sell_px = max(0.01, round(ref_px - 0.05, 4))
+        sh = max(0.01, round(shares - 0.01, 2))
+        resp = await client.place_limit_order(
             token_id=token_id, side="SELL",
-            price=str(sell_px), size=str(shares_safe))
-        return response.ok
+            price=str(sell_px), size=str(sh))
+        return bool(resp.ok), sell_px
     except Exception as e:
-        log.error("Exception revente orpheline: " + str(e))
-        return False
+        log.error("sell_orphan: " + str(e))
+        return False, 0.0
 
-async def execute_arb_async(up_id, up_px, down_id, down_px,
-                             shares, market_key, window_ts):
-    """
-    Execute l'arbitrage : achete les DEUX jambes.
-    Si une seule s'execute -> revend l'orpheline immediatement.
-    Retourne (ok, cout_total) ; ok=True si les deux jambes tenues.
-    """
+async def execute_real(up_id, down_id, meas, mkey):
+    """Execute l'arb pour de vrai, avec fill confirme et orpheline geree."""
     global daily_pnl
+    from polymarket import AsyncSecureClient
+    target = meas["target"]
+    # limite = pire prix qu'on accepte de payer en marchant le carnet
+    up_lim   = min(0.99, round(meas["worst_up"], 4))
+    down_lim = min(0.99, round(meas["worst_down"], 4))
+    async with await AsyncSecureClient.create(
+            private_key=PRIVATE_KEY, wallet=WALLET) as client:
+        oid_up, oid_down = await asyncio.gather(
+            buy_leg(client, up_id, up_lim, target),
+            buy_leg(client, down_id, down_lim, target),
+        )
+        f_up, f_down = await asyncio.gather(
+            confirm_fill(client, oid_up, target),
+            confirm_fill(client, oid_down, target),
+        )
+        log.info("[" + mkey + "] fills | UP " + str(round(f_up, 2))
+                 + " | DOWN " + str(round(f_down, 2))
+                 + " | vise " + str(target))
+
+        both = f_up >= 1.0 and f_down >= 1.0
+        if both:
+            shares = min(f_up, f_down)
+            sum_paid = meas["avg_up"] + meas["avg_down"]
+            # si fills inegaux, l'exces d'un cote est une mini-orpheline a revendre
+            if abs(f_up - f_down) >= 1.0:
+                big, big_id, ref = (f_up, up_id, up_lim) if f_up > f_down \
+                    else (f_down, down_id, down_lim)
+                await sell_orphan(client, big_id, big - shares, ref)
+            return True, shares, sum_paid
+
+        # une seule jambe -> orpheline, revente immediate, perte reelle comptee
+        if f_up >= 1.0:
+            ok, spx = await sell_orphan(client, up_id, f_up, up_lim)
+            perte = (up_lim - spx) * f_up if ok else up_lim * f_up
+            daily_pnl -= perte
+            log.warning("[" + mkey + "] ORPHELINE UP revendue, perte ~"
+                        + str(round(perte, 2)) + "$")
+            return False, 0, 0
+        if f_down >= 1.0:
+            ok, spx = await sell_orphan(client, down_id, f_down, down_lim)
+            perte = (down_lim - spx) * f_down if ok else down_lim * f_down
+            daily_pnl -= perte
+            log.warning("[" + mkey + "] ORPHELINE DOWN revendue, perte ~"
+                        + str(round(perte, 2)) + "$")
+            return False, 0, 0
+        log.info("[" + mkey + "] aucune jambe remplie")
+        return False, 0, 0
+
+# ------------------------- Observation -------------------------
+def record_obs(mkey, window_ts, meas):
+    global obs_seen, obs_executable, obs_hypo_pnl
+    obs_seen += 1
+    if meas["executable"]:
+        obs_executable += 1
+        obs_hypo_pnl += meas["hypo_pnl"]
     try:
-        from polymarket import AsyncSecureClient
-        async with await AsyncSecureClient.create(
-                private_key=PRIVATE_KEY, wallet=WALLET) as client:
-
-            # Achat agressif des deux jambes (+0.01 pour execution sure)
-            up_buy   = min(0.99, round(up_px + 0.01, 4))
-            down_buy = min(0.99, round(down_px + 0.01, 4))
-
-            # CORRECTION : achete les DEUX jambes EN PARALLELE (asyncio.gather)
-            # Avant, elles partaient l'une apres l'autre -> le prix de la 2e bougeait
-            # et l'arbitrage echouait. La, elles partent en meme temps.
-            (ok_up, oid_up), (ok_down, oid_down) = await asyncio.gather(
-                buy_leg(client, up_id, up_buy, shares),
-                buy_leg(client, down_id, down_buy, shares),
-            )
-
-            if not ok_up and not ok_down:
-                log.warning("[" + market_key + "] Aucune jambe executee - abandon")
-                return False, 0
-
-            # Verification reelle des positions dans le wallet
-            # On attend 5s puis on verifie via GET /positions (pas les ordres ouverts)
-            await asyncio.sleep(5)
-
-            filled = {"up": False, "down": False}
-            try:
-                # Verification via positions reelles dans le wallet
-                import aiohttp
-                headers = {"Authorization": "Bearer " + CLOB_API_KEY} \
-                    if "CLOB_API_KEY" in globals() and CLOB_API_KEY else {}
-                
-                async def get_position_size(token_id):
-                    """Recupere le solde reel du token dans le wallet via CLOB API."""
-                    url = "https://clob.polymarket.com/positions"
-                    try:
-                        async with aiohttp.ClientSession() as s:
-                            async with s.get(url,
-                                    params={"user": WALLET},
-                                    timeout=aiohttp.ClientTimeout(total=8)) as resp:
-                                if resp.status == 200:
-                                    data = await resp.json()
-                                    positions = data if isinstance(data, list) \
-                                        else data.get("positions", [])
-                                    for pos in positions:
-                                        tid = pos.get("asset_id") or pos.get("token_id", "")
-                                        if str(tid) == str(token_id):
-                                            size = float(pos.get("size", 0))
-                                            return size
-                    except Exception:
-                        pass
-                    return 0.0
-
-                size_up   = await get_position_size(up_id)
-                size_down = await get_position_size(down_id)
-
-                filled["up"]   = size_up   >= shares * 0.9   # tolerance 10%
-                filled["down"] = size_down >= shares * 0.9
-
-                log.info("[" + market_key + "] Verif positions | UP: "
-                         + str(round(size_up, 2)) + " shares | DOWN: "
-                         + str(round(size_down, 2)) + " shares | attendu: "
-                         + str(shares))
-
-                # Annule les ordres ouverts non executes
-                cancel = getattr(client, "cancel_order", None)
-                if not filled["up"] and oid_up and cancel:
-                    try:
-                        await cancel(order_id=oid_up)
-                        log.warning("[" + market_key + "] Ordre UP annule (non execute)")
-                    except Exception:
-                        pass
-                if not filled["down"] and oid_down and cancel:
-                    try:
-                        await cancel(order_id=oid_down)
-                        log.warning("[" + market_key + "] Ordre DOWN annule (non execute)")
-                    except Exception:
-                        pass
-
-            except Exception as ve:
-                log.warning("Verif positions impossible: " + str(ve))
-                # Fallback : si verification impossible, on se fie a ok_up/ok_down
-                filled["up"]   = ok_up
-                filled["down"] = ok_down
-
-            # Cas 1 : les deux jambes tenues -> arbitrage verrouille
-            if filled["up"] and filled["down"]:
-                cout = (up_buy + down_buy) * shares
-                gain_prevu = (1.0 - up_buy - down_buy) * shares
-                log.info("[" + market_key + "] ARB VERROUILLE | somme "
-                         + str(round(up_buy + down_buy, 3))
-                         + " | " + str(shares) + " shares | gain prevu +"
-                         + str(round(gain_prevu, 2)) + "$")
-                return True, cout
-
-            # Cas 2 : jambe orpheline -> revente immediate
-            if filled["up"] and not filled["down"]:
-                log.warning("[" + market_key + "] Jambe DOWN manquante"
-                            + " - revente UP immediate")
-                await sell_leg(client, up_id, shares, up_buy)
-                perte = 0.05 * shares   # estimation pessimiste du cout
-                daily_pnl -= perte
-                save_daily_pnl(daily_pnl)
-                return False, 0
-            if filled["down"] and not filled["up"]:
-                log.warning("[" + market_key + "] Jambe UP manquante"
-                            + " - revente DOWN immediate")
-                await sell_leg(client, down_id, shares, down_buy)
-                perte = 0.05 * shares
-                daily_pnl -= perte
-                save_daily_pnl(daily_pnl)
-                return False, 0
-
-            return False, 0
+        row = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "market": mkey, "window_ts": window_ts,
+            "best_sum": round(meas["best_sum"], 4),
+            "eff_sum": round(meas["eff_sum"], 4),
+            "slippage": round(meas["eff_sum"] - meas["best_sum"], 4),
+            "target": meas["target"], "fillable": round(meas["fillable"], 2),
+            "executable": meas["executable"],
+            "hypo_pnl": round(meas["hypo_pnl"], 3),
+        }
+        with open(OBS_FILE, "a") as f:
+            f.write(json.dumps(row) + "\n")
     except Exception as e:
-        log.error("Exception arbitrage: " + str(e))
-        return False, 0
+        log.error("record_obs: " + str(e))
 
-def execute_arb(up_id, up_px, down_id, down_px, shares, market_key, window_ts):
-    return asyncio.run(execute_arb_async(up_id, up_px, down_id, down_px,
-                                          shares, market_key, window_ts))
+def obs_report():
+    if obs_seen == 0:
+        log.info("[OBS] aucune opportunite vue pour l'instant")
+        return
+    pct = 100.0 * obs_executable / obs_seen
+    log.info("[OBS] ===== {} opportunites vues =====".format(obs_seen))
+    log.info("[OBS] reellement executables EN TAILLE : {}/{} ({:.0f}%)"
+             .format(obs_executable, obs_seen, pct))
+    log.info("[OBS] PnL hypothetique cumule (verrouille) : {:+.2f}$"
+             .format(obs_hypo_pnl))
+    if obs_seen >= 20 and obs_executable == 0:
+        log.info("[OBS] >>> 0 arb survit en taille : l'edge n'existe qu'a "
+                 "l'ecran. Ne PAS passer en reel.")
+    elif obs_executable > 0:
+        log.info("[OBS] >>> certains arbs survivent : regarde le PnL hypo "
+                 "et la part executable avant de passer OBSERVE_ONLY=false.")
 
-# ============================================================
-# THREAD : comptabilise les arbitrages expires
-# ============================================================
-
+# ------------------------- Reglement -------------------------
 def settle_loop():
     global daily_pnl
-    log.info("Thread reglement demarre")
     while True:
         try:
             now = int(time.time())
             with arbs_lock:
-                arbs_copy = list(open_arbs)
-            for arb in arbs_copy:
-                # expire ?
+                copy = list(open_arbs)
+            for arb in copy:
                 if now >= arb["expiry"] + 30:
-                    # l'un des deux tokens vaut 1.00 a l'expiration
                     gain = (1.0 - arb["sum_paid"]) * arb["shares"]
                     daily_pnl += gain
-                    save_daily_pnl(daily_pnl)
-                    log.info("[" + arb["market"] + "] ARB REGLE | +"
-                             + str(round(gain, 2)) + "$ | PnL jour: "
+                    log.info("[" + arb["market"] + "] ARB REGLE +"
+                             + str(round(gain, 2)) + "$ | PnL jour "
                              + str(round(daily_pnl, 2)) + "$")
                     with arbs_lock:
                         if arb in open_arbs:
                             open_arbs.remove(arb)
         except Exception as e:
-            log.error("Erreur reglement: " + str(e))
+            log.error("settle: " + str(e))
         time.sleep(10)
 
-
-# ============================================================
-# ============================================================
-# SCANNER GLOBAL SPORT : marches sportifs actifs (CdM, foot, etc.)
-# Ameliorations :
-# 1. Scan toutes les 10s (au lieu de 60s) pour capter les pics de volatilite
-# 2. Filtre sport/foot uniquement (pas politique, pas crypto)
-# 3. Detection matchs en direct : priorite aux marches qui expirent dans <4h
-# ============================================================
-
-GLOBAL_SCAN_INTERVAL = int(os.getenv("ARB_GLOBAL_SCAN_INTERVAL", "10"))
-GLOBAL_MAX_DAYS_LEFT = float(os.getenv("ARB_GLOBAL_MAX_DAYS", "7"))
-
-# Mots-cles sport/foot pour filtrer uniquement les marches pertinents
-SPORT_KEYWORDS = [
-    "win", "goal", "match", "game", "score", "cup", "world",
-    "fifa", "soccer", "football", "league", "champion", "final",
-    "semi", "quarter", "group", "team", "player", "beat",
-    "coupe", "monde", "equipe", "gagner", "marquer",
-    # Equipes Coupe du Monde 2026
-    "france", "brazil", "argentina", "england", "spain", "germany",
-    "portugal", "morocco", "senegal", "ivory", "nigeria", "ghana",
-    "usa", "mexico", "japan", "korea", "australia", "croatia",
-]
-
-def is_sport_market(question):
-    """Retourne True si le marche est sportif."""
-    q = question.lower()
-    return any(kw in q for kw in SPORT_KEYWORDS)
-
-def is_live_match(end_ts):
-    """Retourne True si le marche expire dans moins de 4h (match en direct probable)."""
-    hours_left = (end_ts - time.time()) / 3600
-    return 0 < hours_left < 4
-
-def scan_global_markets():
-    """Scanne les marches sportifs actifs, cherche Yes+No < seuil."""
-    found = []
-    try:
-        r = SESSION.get(GAMMA_API + "/markets",
-                        params={"active": "true", "closed": "false",
-                                "limit": 100, "order": "volume24hr",
-                                "ascending": "false"}, timeout=15)
-        if not r.ok:
-            return found
-        for m in r.json():
-            try:
-                question  = m.get("question", "")
-                outcomes  = json.loads(m.get("outcomes", "[]")) \
-                    if isinstance(m.get("outcomes"), str) else m.get("outcomes", [])
-                token_ids = json.loads(m.get("clobTokenIds", "[]")) \
-                    if isinstance(m.get("clobTokenIds"), str) else m.get("clobTokenIds", [])
-
-                if len(outcomes) != 2 or len(token_ids) != 2:
-                    continue
-
-                # FILTRE 1 : sport uniquement
-                if not is_sport_market(question):
-                    continue
-
-                # FILTRE 2 : date de fin (pas trop loin)
-                end = m.get("endDate") or m.get("end_date_iso")
-                end_ts = None
-                if end:
-                    try:
-                        end_ts = datetime.fromisoformat(end.replace("Z", "+00:00")).timestamp()
-                        days_left = (end_ts - time.time()) / 86400
-                        if days_left > GLOBAL_MAX_DAYS_LEFT or days_left < 0:
-                            continue
-                    except:
-                        pass
-
-                a0, d0 = get_best_ask(token_ids[0])
-                a1, d1 = get_best_ask(token_ids[1])
-                if a0 is None or a1 is None:
-                    continue
-
-                total = a0 + a1
-                if total <= SUM_MAX:
-                    live = is_live_match(end_ts) if end_ts else False
-                    found.append({
-                        "question": question[:60],
-                        "t0": token_ids[0], "p0": a0, "d0": d0,
-                        "t1": token_ids[1], "p1": a1, "d1": d1,
-                        "total": total,
-                        "live": live,  # match en direct = priorite
-                    })
-            except Exception:
-                continue
-
-        # Trie : matchs en direct d'abord, puis par somme la plus basse
-        found.sort(key=lambda x: (not x["live"], x["total"]))
-
-    except Exception as e:
-        log.error("Scan global: " + str(e))
-    return found
-
-def global_scan_loop():
-    log.info("Scanner global SPORT demarre - toutes les "
-             + str(GLOBAL_SCAN_INTERVAL) + "s"
-             + " | filtre: foot/sport | live match prioritaire")
-    global daily_pnl
-    while True:
-        try:
-            if daily_pnl > -STOP_LOSS_USDC:
-                opps = scan_global_markets()
-                for o in opps:
-                    live_tag = " [LIVE]" if o.get("live") else ""
-                    log.info("[GLOBAL" + live_tag + "] OPPORTUNITE | "
-                             + o["question"]
-                             + " | somme " + str(round(o["total"], 3))
-                             + " | profondeur " + str(round(min(o["d0"], o["d1"]), 1)))
-                    with arbs_lock:
-                        n = len(open_arbs)
-                    if n >= MAX_CONCURRENT:
-                        continue
-                    shares_cap   = math.floor(GLOBAL_TRADE_USDC / o["total"] * 100) / 100
-                    shares_depth = math.floor(min(o["d0"], o["d1"]) * 100) / 100
-                    shares       = min(shares_cap, shares_depth)
-                    if shares < 1:
-                        continue
-                    ok, cout = execute_arb(o["t0"], o["p0"], o["t1"], o["p1"],
-                                            shares, "GLOBAL", 0)
-                    if ok:
-                        with arbs_lock:
-                            open_arbs.append({
-                                "market":   "GLOBAL",
-                                "sum_paid": round(o["p0"] + o["p1"] + 0.02, 4),
-                                "shares":   shares,
-                                "expiry":   int(time.time()) + 7 * 86400,
-                            })
-        except Exception as e:
-            log.error("Erreur scan global: " + str(e))
-        time.sleep(GLOBAL_SCAN_INTERVAL)
-
-# ============================================================
-# BOUCLE PRINCIPALE
-# ============================================================
-
+# ------------------------- Boucle principale -------------------------
 def run():
-    global daily_pnl, pnl_date
+    mode = "OBSERVATION (aucun ordre)" if OBSERVE_ONLY else "REEL (argent !)"
+    log.info("Bot ARB v2 demarre | MODE=" + mode
+             + " | seuil " + str(SUM_MAX) + " | trade " + str(TRADE_USDC) + "$"
+             + " | sport " + ("ON" if ENABLE_SPORT else "OFF"))
+    if not OBSERVE_ONLY:
+        log.warning("*** MODE REEL : verifie d'abord ton rapport [OBS] ***")
+        if not PRIVATE_KEY.startswith("0x") or not WALLET.startswith("0x"):
+            log.error("Cles manquantes - arret")
+            return
 
-    log.info("Bot ARBITRAGE Yes+No demarre")
-    log.info("Seuil somme: " + str(SUM_MAX) + " | Trade: "
-             + str(TRADE_USDC) + "$ | Max simultanes: "
-             + str(MAX_CONCURRENT) + " | SL jour: "
-             + str(STOP_LOSS_USDC) + "$")
-    log.info("Marches: " + ", ".join(MARKETS.keys())
-             + " | PnL: " + str(round(daily_pnl, 2)))
-
-    if not PRIVATE_KEY.startswith("0x"):
-        log.error("PRIVATE_KEY manquante!")
-        return
-    if not WALLET.startswith("0x"):
-        log.error("POLYMARKET_WALLET_ADDRESS manquante!")
-        return
-
-    settle_thread = threading.Thread(target=settle_loop, daemon=True)
-    settle_thread.start()
-    global_thread = threading.Thread(target=global_scan_loop, daemon=True)
-    global_thread.start()
-
-    # cache des tokens par fenetre pour eviter les requetes repetees
+    threading.Thread(target=settle_loop, daemon=True).start()
     token_cache = {}
-    last_heartbeat = 0
+    last_report = 0
 
     while True:
         try:
-            # Reset journalier
-            today = date.today()
-            if today != pnl_date:
-                log.info("Nouveau jour - PnL hier: " + str(round(daily_pnl, 2)))
-                append_pnl_history(pnl_date, daily_pnl)
-                daily_pnl = 0.0
-                pnl_date  = today
-                done_windows.clear()
-                save_daily_pnl(0.0)
-                # Affiche l historique complet dans les logs
-                try:
-                    if os.path.exists(PNL_HISTORY):
-                        with open(PNL_HISTORY, "r") as f:
-                            hist = f.read().strip()
-                        if hist:
-                            lines = [l for l in hist.split("\n") if l.strip()]
-                            total = 0.0
-                            for l in lines:
-                                try:
-                                    total += float(l.split("|")[1].replace("$","").strip())
-                                except:
-                                    pass
-                            log.info("=== HISTORIQUE PnL ARB (14 jours) ===\n"
-                                     + hist
-                                     + "TOTAL : " + str(round(total, 4)) + "$")
-                except:
-                    pass
+            if time.time() - last_report > 600:
+                obs_report()
+                last_report = time.time()
 
-            # Stop loss jambes orphelines
-            if daily_pnl <= -STOP_LOSS_USDC:
-                log.warning("Stop-loss arbitrage atteint - pause 1h")
-                time.sleep(3600)
-                continue
-
-            hour_utc = datetime.now(timezone.utc).hour
-            if hour_utc not in ACTIVE_HOURS:
-                time.sleep(60)
-                continue
+            if daily_pnl <= -STOP_LOSS:
+                log.warning("stop-loss jour atteint - pause")
+                time.sleep(300); continue
 
             with arbs_lock:
-                n_open = len(open_arbs)
-            if n_open >= MAX_CONCURRENT:
-                time.sleep(SCAN_INTERVAL)
-                continue
+                if len(open_arbs) >= MAX_CONCUR:
+                    time.sleep(SCAN_INTERVAL); continue
 
             now = int(time.time())
-
             for mkey, mcfg in MARKETS.items():
-                wsize     = mcfg["window"]
+                wsize = mcfg["window"]
                 window_ts = now - (now % wsize)
                 time_left = (window_ts + wsize) - now
-                cache_key = mkey + "_" + str(window_ts)
-
-                # fenetre deja traitee ou trop proche de l'expiration
-                if cache_key in done_windows:
+                ckey = mkey + "_" + str(window_ts)
+                if ckey in done_windows or time_left < MIN_TIME_LEFT:
                     continue
-                if time_left < MIN_TIME_LEFT:
-                    continue
-
-                # tokens de la fenetre (avec cache)
-                if cache_key not in token_cache:
-                    tokens = get_market_tokens(mcfg["slug"], window_ts)
-                    if not tokens or len(tokens) < 2:
+                if ckey not in token_cache:
+                    tk = get_tokens(mcfg["slug"], window_ts)
+                    if not tk:
                         continue
-                    token_cache[cache_key] = tokens
-                    # nettoie le cache
+                    token_cache[ckey] = tk
                     if len(token_cache) > 30:
                         for k in list(token_cache.keys())[:-30]:
                             del token_cache[k]
-                tokens = token_cache[cache_key]
-
-                up    = next((t for t in tokens if t["outcome"] == "Up"), None)
-                down  = next((t for t in tokens if t["outcome"] == "Down"), None)
+                tokens = token_cache[ckey]
+                up   = next((t for t in tokens if t["outcome"] == "Up"), None)
+                down = next((t for t in tokens if t["outcome"] == "Down"), None)
                 if not up or not down:
                     continue
 
-                # lit les deux carnets EN PARALLELE (gain ~50% latence)
-                res = {}
-                def _read(side, tid):
-                    res[side] = get_best_ask(tid)
-                t1 = threading.Thread(target=_read, args=("up", up["token_id"]))
-                t2 = threading.Thread(target=_read, args=("down", down["token_id"]))
-                t1.start(); t2.start(); t1.join(); t2.join()
-                up_px, up_depth     = res.get("up", (None, 0))
-                down_px, down_depth = res.get("down", (None, 0))
-                if up_px is None or down_px is None:
+                asks_up   = get_asks(up["token_id"])
+                asks_down = get_asks(down["token_id"])
+                if not asks_up or not asks_down:
+                    continue
+                if asks_up[0][0] + asks_down[0][0] > SUM_MAX:
+                    continue   # meme le meilleur ask ne passe pas le seuil
+
+                meas = best_executable(asks_up, asks_down, TRADE_USDC, SUM_MAX)
+                if meas is None:
                     continue
 
-                total = up_px + down_px
+                log.info("[" + mkey + "] OPPORTUNITE | best_sum "
+                         + str(round(meas["best_sum"], 3))
+                         + " -> eff_sum " + str(round(meas["eff_sum"], 3))
+                         + " (slippage " + str(round(meas["eff_sum"]
+                                                     - meas["best_sum"], 3))
+                         + ") | dispo " + str(round(meas["fillable"], 1))
+                         + " sh | executable: " + str(meas["executable"]))
+                record_obs(mkey, window_ts, meas)
+                done_windows.add(ckey)
 
-                # Heartbeat : toutes les 5 min, log de la somme observee
-                if time.time() - last_heartbeat >= 300:
-                    log.info("[" + mkey + "] scan actif | somme "
-                             + str(round(total, 3)) + " | seuil "
-                             + str(SUM_MAX) + " | PnL jour: "
-                             + str(round(daily_pnl, 2)) + "$")
-                    last_heartbeat = time.time()
-
-                if total <= SUM_MAX:
-                    # taille : limitee par le capital ET la profondeur dispo
-                    shares_cap   = math.floor(TRADE_USDC / total * 100) / 100
-                    shares_depth = math.floor(min(up_depth, down_depth) * 100) / 100
-                    shares       = min(shares_cap, shares_depth)
-                    if shares < 1:
-                        continue
-
-                    gain_potentiel = (1.0 - total) * shares
-                    log.info("[" + mkey + "] OPPORTUNITE | Up "
-                             + str(up_px) + " + Down " + str(down_px)
-                             + " = " + str(round(total, 3))
-                             + " | gain potentiel +"
-                             + str(round(gain_potentiel, 2)) + "$")
-
-                    ok, cout = execute_arb(up["token_id"], up_px,
-                                            down["token_id"], down_px,
-                                            shares, mkey, window_ts)
-                    done_windows.add(cache_key)
-                    if ok:
-                        with arbs_lock:
-                            open_arbs.append({
-                                "market":   mkey,
-                                "sum_paid": round(up_px + down_px + 0.02, 4),
-                                "shares":   shares,
-                                "expiry":   window_ts + wsize,
-                            })
-
+                if OBSERVE_ONLY:
+                    continue
+                if not meas["executable"]:
+                    log.info("[" + mkey + "] non executable en taille - skip")
+                    continue
+                ok, shares, sum_paid = asyncio.run(
+                    execute_real(up["token_id"], down["token_id"], meas, mkey))
+                if ok:
+                    with arbs_lock:
+                        open_arbs.append({
+                            "market": mkey, "sum_paid": round(sum_paid, 4),
+                            "shares": shares, "expiry": window_ts + wsize,
+                        })
         except Exception as e:
-            log.error("Erreur boucle: " + str(e))
-
+            log.error("boucle: " + str(e))
         time.sleep(SCAN_INTERVAL)
 
 if __name__ == "__main__":
