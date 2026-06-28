@@ -21,6 +21,8 @@ MAX_OPEN_USDC    = float(os.getenv("MAX_OPEN_USDC",    "15"))
 # Seuils de sortie par position
 STOP_LOSS_PCT    = float(os.getenv("STOP_LOSS_PCT",    "0.30"))  # -30% du prix d'entree
 TAKE_PROFIT_GAIN = float(os.getenv("TAKE_PROFIT_GAIN","0.40"))
+TAKE_PROFIT_PCT  = float(os.getenv("TAKE_PROFIT_PCT",  "0.30"))  # +30% de la valeur
+STOP_LOSS_VAL_PCT= float(os.getenv("STOP_LOSS_VAL_PCT","0.25"))  # -25% de la valeur
 EXIT_REVERSAL    = float(os.getenv("EXIT_REVERSAL",    "0.10"))
 BTC_DEVIATION    = float(os.getenv("BTC_DEVIATION",    "150"))
 
@@ -50,8 +52,8 @@ GAP_PCT          = float(os.getenv("GAP_PCT",          "0.09"))
 # Fourchette d'entree resserree : on plafonne a 0.65 (au lieu de 0.75)
 # Acheter a 0.75 = gain max limité, perte max totale → mauvais rapport
 # Entre 0.52 et 0.65, le rapport risque/gain est plus equilibre
-ENTRY_PRICE_MIN  = float(os.getenv("ENTRY_PRICE_MIN",  "0.52"))
-ENTRY_PRICE_MAX  = float(os.getenv("ENTRY_PRICE_MAX",  "0.68"))
+ENTRY_PRICE_MIN  = float(os.getenv("ENTRY_PRICE_MIN",  "0.59"))
+ENTRY_PRICE_MAX  = float(os.getenv("ENTRY_PRICE_MAX",  "0.73"))
 
 # Entree uniquement dans la 1ere minute (60s) -- garde
 ENTRY_WINDOW_MAX = int(os.getenv("ENTRY_WINDOW_MAX",   "60"))
@@ -498,9 +500,11 @@ def monitor_loop():
                     to_remove.append(pos)
                     pos["sold"] = True  # evite double vente
 
-                # 3. TAKE PROFIT : +40% de gain par rapport a l'entree
-                elif current >= entry * (1 + TAKE_PROFIT_GAIN):
-                    log.info("TAKE PROFIT +40%! @ " + str(round(current, 3)))
+                # 3. TAKE PROFIT : valeur position >= mise * (1 + 30%)
+                elif current * shares >= pos["size"] * (1 + TAKE_PROFIT_PCT):
+                    val = round(current * shares, 2)
+                    log.info("TAKE PROFIT +30%! valeur " + str(val)
+                             + "$ >= " + str(round(pos["size"] * (1 + TAKE_PROFIT_PCT), 2)) + "$")
                     if sell_order(token_id, shares, "TP", current):
                         pnl = (max(0.01, current - 0.04) - entry) * shares
                         daily_pnl += pnl
@@ -511,12 +515,12 @@ def monitor_loop():
                         to_remove.append(pos)
                         pos["sold"] = True  # evite double vente
 
-                # 4. Stop loss : valeur position < mise * (1 - 30%)
-                elif current * shares <= pos["size"] * (1 - STOP_LOSS_PCT):
+                # 4. Stop loss : valeur position <= mise * (1 - 25%)
+                elif current * shares <= pos["size"] * (1 - STOP_LOSS_VAL_PCT):
                     val = round(current * shares, 2)
-                    log.info("STOP LOSS -30%! valeur " + str(val)
-                             + "$ < " + str(round(pos["size"] * (1 - STOP_LOSS_PCT), 2)) + "$")
-                    if sell_order(token_id, shares, "SL-30%", current):
+                    log.info("STOP LOSS -25%! valeur " + str(val)
+                             + "$ <= " + str(round(pos["size"] * (1 - STOP_LOSS_VAL_PCT), 2)) + "$")
+                    if sell_order(token_id, shares, "SL", current):
                         pnl = (max(0.01, current - 0.04) - entry) * shares
                         daily_pnl += pnl
                         save_daily_pnl(daily_pnl)
