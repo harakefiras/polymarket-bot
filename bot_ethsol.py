@@ -21,6 +21,8 @@ MAX_OPEN_USDC     = float(os.getenv("ETHSOL_MAX_OPEN_USDC",     "20"))
 # Seuils de sortie par position
 STOP_LOSS_PCT     = float(os.getenv("ETHSOL_STOP_LOSS_PCT",     "0.30"))  # -30% du prix d'entree
 TAKE_PROFIT_GAIN  = float(os.getenv("ETHSOL_TAKE_PROFIT_GAIN", "0.40"))
+TAKE_PROFIT_PCT   = float(os.getenv("ETHSOL_TAKE_PROFIT_PCT",  "0.30"))  # +30% valeur
+STOP_LOSS_VAL_PCT = float(os.getenv("ETHSOL_STOP_LOSS_VAL_PCT","0.25"))  # -25% valeur
 EXIT_REVERSAL     = float(os.getenv("ETHSOL_EXIT_REVERSAL",     "0.10"))
 
 # Surveillance
@@ -52,8 +54,8 @@ MARKETS = {
         "dyn_min":    float(os.getenv("ETH_DYN_GAP_MIN", "3")),
         "dyn_max":    float(os.getenv("ETH_DYN_GAP_MAX", "50")),
         "deviation": float(os.getenv("ETH_DEVIATION", "50")),
-        "entry_min": float(os.getenv("ETH_ENTRY_PRICE_MIN", "0.52")),
-        "entry_max": float(os.getenv("ETH_ENTRY_PRICE_MAX", "0.68")),
+        "entry_min": float(os.getenv("ETH_ENTRY_PRICE_MIN", "0.59")),
+        "entry_max": float(os.getenv("ETH_ENTRY_PRICE_MAX", "0.73")),
     },
     "SOL": {
         "slug":     "sol-updown-15m-",
@@ -64,8 +66,8 @@ MARKETS = {
         "dyn_min":    float(os.getenv("SOL_DYN_GAP_MIN", "0.3")),
         "dyn_max":    float(os.getenv("SOL_DYN_GAP_MAX", "5")),
         "deviation": float(os.getenv("SOL_DEVIATION", "10")),
-        "entry_min": float(os.getenv("SOL_ENTRY_PRICE_MIN", "0.52")),
-        "entry_max": float(os.getenv("SOL_ENTRY_PRICE_MAX", "0.68")),
+        "entry_min": float(os.getenv("SOL_ENTRY_PRICE_MIN", "0.59")),
+        "entry_max": float(os.getenv("SOL_ENTRY_PRICE_MAX", "0.73")),
     }
 }
 
@@ -512,25 +514,26 @@ def monitor_loop():
                         to_remove.append((market, pos))
                         pos["sold"] = True  # evite double vente
 
-                    # 3. TAKE PROFIT : +40% de gain par rapport a l'entree
-                    elif current >= entry * (1 + TAKE_PROFIT_GAIN):
+                    # 3. TAKE PROFIT : valeur position >= mise * (1 + 30%)
+                    elif current * shares >= pos["size"] * (1 + TAKE_PROFIT_PCT):
+                        val = round(current * shares, 2)
                         if sell_order(token_id, shares, "TP", current):
                             pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
                             s["consecutive_losses"] = 0
-                            log.info("[" + market + "] TP +40% +"
-                                     + str(round(pnl, 2))
+                            log.info("[" + market + "] TP +30% valeur " + str(val)
+                                     + "$ | +" + str(round(pnl, 2))
                                      + " | Total: " + str(round(s["daily_pnl"], 2)))
                             to_remove.append((market, pos))
-                            pos["sold"] = True  # evite double vente
+                            pos["sold"] = True
 
-                    # 4. Stop loss : valeur position < mise * (1 - 30%)
-                    elif current * shares <= pos["size"] * (1 - STOP_LOSS_PCT):
+                    # 4. Stop loss : valeur position <= mise * (1 - 25%)
+                    elif current * shares <= pos["size"] * (1 - STOP_LOSS_VAL_PCT):
                         val = round(current * shares, 2)
-                        log.info("[" + market + "] STOP LOSS -30%! valeur "
+                        log.info("[" + market + "] STOP LOSS -25%! valeur "
                                  + str(val) + "$")
-                        if sell_order(token_id, shares, "SL-30%", current):
+                        if sell_order(token_id, shares, "SL", current):
                             pnl = (max(0.01, current - 0.04) - entry) * shares
                             s["daily_pnl"] += pnl
                             save_daily_pnl(market, s["daily_pnl"])
