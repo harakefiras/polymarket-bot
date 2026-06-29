@@ -219,6 +219,18 @@ async def buy_leg(client, token_id, limit_px, shares):
         log.error("buy_leg: " + str(e))
     return None
 
+async def cancel_leg(client, order_id):
+    """Annule un ordre non rempli pour qu'il ne traine pas sur le carnet
+    et ne devienne pas une position fantome remplie apres coup."""
+    if not order_id:
+        return
+    try:
+        cancel = getattr(client, "cancel_order", None)
+        if cancel:
+            await cancel(order_id=order_id)
+    except Exception as e:
+        log.error("cancel_leg: " + str(e))
+
 async def sell_orphan(client, token_id, shares, ref_px):
     """Revend une jambe orpheline immediatement, agressivement."""
     try:
@@ -250,6 +262,18 @@ async def execute_real(up_id, down_id, meas, mkey):
             confirm_fill(client, oid_up, target),
             confirm_fill(client, oid_down, target),
         )
+        # CORRECTION CLE : on annule TOUT ordre non confirme rempli, AVANT de
+        # decider quoi que ce soit. Sinon un ordre limite reste pose sur le
+        # carnet, remplit apres notre fenetre de verif, et devient une position
+        # fantome que le bot ne suit pas (bug observe). On annule puis on relit
+        # une derniere fois pour rattraper la course (jambe remplie juste avant
+        # l'annulation).
+        if f_up < 1.0:
+            await cancel_leg(client, oid_up)
+            f_up = await confirm_fill(client, oid_up, target)
+        if f_down < 1.0:
+            await cancel_leg(client, oid_down)
+            f_down = await confirm_fill(client, oid_down, target)
         log.info("[" + mkey + "] fills | UP " + str(round(f_up, 2))
                  + " | DOWN " + str(round(f_down, 2))
                  + " | vise " + str(target))
