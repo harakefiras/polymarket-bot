@@ -76,8 +76,6 @@ CLOB_API  = "https://clob.polymarket.com"
 
 MARKETS = {
     "BTC5":  {"slug": "btc-updown-5m-",  "window": 300},
-    "ETH15": {"slug": "eth-updown-15m-", "window": 900},
-    "SOL15": {"slug": "sol-updown-15m-", "window": 900},
 }
 
 # Etat
