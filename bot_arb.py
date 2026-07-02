@@ -44,6 +44,8 @@ import requests
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(message)s", stream=sys.stdout)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 try:
     sys.stdout.reconfigure(line_buffering=True)
 except Exception:
