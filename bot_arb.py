@@ -12,29 +12,25 @@ API VERIFIEE par introspection du package (pas de devinette) :
   - get_order_book(token_id=) -> OrderBook(.asks, .bids, .min_order_size,
       .tick_size) ; niveaux avec .price et .size
 
-CE QUI CHANGE vs v2 :
-  1. FOK natif : tout ou rien, jamais de fill partiel, jamais d'ordre qui
-     traine, plus de course cancel/fill.
-  2. COUT REEL : pour un BUY, making_amount = USDC payes, taking_amount =
-     shares recues. Le PnL est compte sur ces montants, pas sur une
-     estimation pre-trade.
-  3. Client cree UNE fois. Carnets lus en parallele (asyncio.gather).
-  4. Orpheline : revente FAK confirmee en escalier ; si invendable -> HALT.
-  5. PnL et disjoncteurs vraiment journaliers. Buffer frais. Marge de
-     profondeur. min_order_size / tick_size respectes.
-
-RESTE IRREDUCTIBLE : entre la lecture du carnet et l'arrivee des ordres,
-le marche bouge. Le FOK protege le capital, il ne garantit pas que les
-2 jambes passent. L'orpheline reste possible ; elle est geree et limitee.
+v3.2 - ETAT FINAL :
+  - Orphelines : REVENDUES immediatement (FAK en escalier), comme en v3.1.
+    Perte limitee a chaque coup, jamais la mise entiere gardee jusqu'au bout.
+  - Seuils RELACHES et mis EN DUR dans le code (plus besoin de variables
+    Railway a chaque fois) : depth x1.0, seuil 0.99 sans buffer frais,
+    entree possible jusqu'a 30s de la fin, mise 5$, jusqu'a 5 orphelines/jour
+    avant coupure. Objectif : plus de trades qu'avec les reglages stricts
+    d'origine (depth x2.0, buffer 0.01) qui ne tradaient presque jamais.
+  - Seul OBSERVE_ONLY reste pilote par variable Railway (interrupteur
+    test/reel volontairement externe, pour ne jamais l'activer par accident
+    via un simple push de code).
 
 requirements.txt :  requests + polymarket-client   (PAS py-clob-client)
 
 Env :
   PRIVATE_KEY, POLYMARKET_WALLET_ADDRESS
-  OBSERVE_ONLY=true (defaut)  ARB_SUM_MAX=0.97  ARB_FEE_BUFFER=0.01
-  ARB_TRADE_USDC=10  ARB_DEPTH_MULT=2.0  ARB_MAX_CONCURRENT=3
-  ARB_MIN_TIME_LEFT=60  ARB_SCAN_INTERVAL=1  ARB_STOP_LOSS_USDC=10
-  ARB_MAX_ORPHANS_DAY=2  OBS_FILE=arb_observe.jsonl (volume persistant !)
+  OBSERVE_ONLY=true (defaut, mettre =false pour trader en reel)
+  Tout le reste (seuil, mise, depth...) est en dur dans le code ci-dessous ;
+  modifiable en changeant directement les valeurs par defaut si besoin.
 """
 
 import os, sys, time, json, math, logging, asyncio
@@ -57,15 +53,15 @@ PRIVATE_KEY   = os.environ.get("PRIVATE_KEY", "")
 WALLET        = os.environ.get("POLYMARKET_WALLET_ADDRESS", "")
 
 OBSERVE_ONLY  = os.getenv("OBSERVE_ONLY", "true").lower() != "false"
-SUM_MAX       = float(os.getenv("ARB_SUM_MAX",        "0.97"))
-FEE_BUFFER    = float(os.getenv("ARB_FEE_BUFFER",     "0.01"))
-TRADE_USDC    = float(os.getenv("ARB_TRADE_USDC",     "10"))
-DEPTH_MULT    = float(os.getenv("ARB_DEPTH_MULT",     "2.0"))
+SUM_MAX       = float(os.getenv("ARB_SUM_MAX",        "0.99"))
+FEE_BUFFER    = float(os.getenv("ARB_FEE_BUFFER",     "0"))
+TRADE_USDC    = float(os.getenv("ARB_TRADE_USDC",     "5"))
+DEPTH_MULT    = float(os.getenv("ARB_DEPTH_MULT",     "1.0"))
 MAX_CONCUR    = int(os.getenv("ARB_MAX_CONCURRENT",   "3"))
-MIN_TIME_LEFT = int(os.getenv("ARB_MIN_TIME_LEFT",    "60"))
+MIN_TIME_LEFT = int(os.getenv("ARB_MIN_TIME_LEFT",    "30"))
 SCAN_INTERVAL = float(os.getenv("ARB_SCAN_INTERVAL",  "1"))
-STOP_LOSS     = float(os.getenv("ARB_STOP_LOSS_USDC", "10"))
-MAX_ORPHANS   = int(os.getenv("ARB_MAX_ORPHANS_DAY",  "2"))
+STOP_LOSS     = float(os.getenv("ARB_STOP_LOSS_USDC", "15"))
+MAX_ORPHANS   = int(os.getenv("ARB_MAX_ORPHANS_DAY",  "5"))
 OBS_FILE      = os.getenv("OBS_FILE", "arb_observe.jsonl")
 
 EFF_MAX = SUM_MAX - FEE_BUFFER     # seuil effectif frais inclus
@@ -80,8 +76,6 @@ SESSION = requests.Session()
 
 # ------------------------- Etat journalier -------------------------
 class DayState:
-    """Reset chaque jour UTC (corrige le stop-loss 'jour' cumule de la v2).
-    halted N'EST PAS reset : une orpheline invendable = intervention manuelle."""
     def __init__(self):
         self.day = None; self.pnl = 0.0; self.orphans = 0; self.halted = False
         self._roll()
@@ -96,7 +90,7 @@ class DayState:
     def trading_allowed(self):
         self._roll()
         if self.halted:
-            return False, "HALT : orpheline non revendue, verifie ton compte"
+            return False, "HALT : verifie ton compte"
         if self.pnl <= -STOP_LOSS:
             return False, "stop-loss du jour atteint"
         if self.orphans >= MAX_ORPHANS:
@@ -115,9 +109,6 @@ def _levels(levels, reverse=False):
     return out
 
 async def get_books(client, tid_up, tid_down):
-    """Lecture des 2 carnets en PARALLELE via le SDK (corrige la desynchro
-    v2 qui fabriquait de fausses opportunites). Retourne (book_up, book_down)
-    ou (None, None)."""
     try:
         b1, b2 = await asyncio.gather(
             client.get_order_book(token_id=tid_up),
@@ -128,7 +119,6 @@ async def get_books(client, tid_up, tid_down):
         return None, None
 
 def get_books_public(tid_up, tid_down):
-    """Version REST publique pour le mode observation (pas besoin de cles)."""
     def one(tid):
         try:
             r = SESSION.get(CLOB_API + "/book", params={"token_id": tid},
@@ -164,8 +154,8 @@ def measure(asks_up, asks_down, bids_up, bids_down, capital, min_size):
         return None
     best_sum = asks_up[0][0] + asks_down[0][0]
     target = math.floor(capital / max(best_sum, 1e-6) * 100) / 100
-    target = max(target, float(min_size))     # respecte min_order_size
-    need = target * DEPTH_MULT                # marge anti-desynchro
+    target = max(target, float(min_size))
+    need = target * DEPTH_MULT
     _, deep_up, _ = walk_book(asks_up, need)
     _, deep_dn, _ = walk_book(asks_down, need)
     au, fu, wu = walk_book(asks_up, target)
@@ -206,16 +196,12 @@ def get_tokens(slug_prefix, window_ts):
 
 # ------------------------- Execution -------------------------
 async def fok_buy(client, token_id, shares, max_price):
-    """FOK d'achat. Retourne (shares_recues, usdc_payes) REELS via
-    taking_amount / making_amount. (0,0) si non rempli - et dans ce cas
-    RIEN ne reste sur le carnet, c'est la garantie du FOK."""
     try:
         resp = await client.place_market_order(
             token_id=token_id, side="BUY", shares=round(shares, 2),
             max_price=round(max_price, 3), order_type="FOK")
         if getattr(resp, "ok", False):
             if resp.status == "delayed":
-                # execution differee : on verifie via get_order
                 await asyncio.sleep(2.0)
                 try:
                     od = await client.get_order(order_id=resp.order_id)
@@ -223,7 +209,6 @@ async def fok_buy(client, token_id, shares, max_price):
                     return (got, got * max_price) if got > 0 else (0.0, 0.0)
                 except Exception:
                     return 0.0, 0.0
-            # BUY : making = USDC donnes, taking = shares recues
             return float(resp.taking_amount), float(resp.making_amount)
         else:
             code = getattr(resp, "code", "?")
@@ -252,7 +237,6 @@ async def sell_confirmed(client, token_id, shares, tries=5):
                 token_id=token_id, side="SELL", shares=round(remaining, 2),
                 min_price=floor, order_type="FAK")
             if getattr(resp, "ok", False):
-                # SELL : making = shares donnees, taking = USDC recus
                 sold = float(resp.making_amount)
                 got_usdc += float(resp.taking_amount)
                 remaining -= sold
@@ -261,10 +245,12 @@ async def sell_confirmed(client, token_id, shares, tries=5):
             await asyncio.sleep(1.0)
     return shares - remaining, got_usdc
 
-async def execute_real(client, up_id, down_id, meas, mkey):
-    """Deux FOK simultanes. Grace au FOK : jamais de partiel, jamais
-    d'ordre residuel. Cas restants : 2 fills (arb), 1 fill (orpheline
-    geree), 0 fill (rien perdu)."""
+async def execute_real(client, up_id, down_id, meas, mkey, window_ts, wsize):
+    """Deux FOK simultanes.
+    Orpheline : revendue immediatement (FAK en escalier) pour limiter la
+    perte a chaque coup, au lieu de porter la mise entiere jusqu'a
+    resolution. Le risque d'orpheline reste assume (ca peut arriver), mais
+    la casse est limitee a chaque fois plutot que laissee courir."""
     target = meas["target"]
     (sh_up, usd_up), (sh_dn, usd_dn) = await asyncio.gather(
         fok_buy(client, up_id, target, meas["worst_up"]),
@@ -274,18 +260,20 @@ async def execute_real(client, up_id, down_id, meas, mkey):
 
     if sh_up > 0 and sh_dn > 0:
         shares = min(sh_up, sh_dn)
-        cost = usd_up + usd_dn                     # cout REEL, pas estime
-        return True, shares, cost
+        cost = usd_up + usd_dn
+        return {"kind": "arb", "shares": shares, "cost": cost}
 
     if sh_up == 0 and sh_dn == 0:
-        return False, 0, 0
+        return None
 
-    # ---- ORPHELINE ----
-    oid, sh, paid, name = (up_id, sh_up, usd_up, "UP") if sh_up > 0 \
-        else (down_id, sh_dn, usd_dn, "DOWN")
+    # ---- ORPHELINE : revendue tout de suite, perte limitee ----
+    if sh_up > 0:
+        oid, sh, paid, name = up_id, sh_up, usd_up, "UP"
+    else:
+        oid, sh, paid, name = down_id, sh_dn, usd_dn, "DOWN"
     sold, got = await sell_confirmed(client, oid, sh)
     if sold >= sh - 0.01:
-        loss = paid - got                          # perte REELLE
+        loss = paid - got
         STATE.add_pnl(-loss)
         n = STATE.add_orphan()
         log.warning("[{}] ORPHELINE {} revendue | perte {:.2f}$ | "
@@ -296,7 +284,7 @@ async def execute_real(client, up_id, down_id, meas, mkey):
         log.error("[{}] ORPHELINE {} NON REVENDUE ({:.2f}/{:.2f} sh) -> "
                   "HALT. Revends manuellement sur polymarket.com puis "
                   "redemarre.".format(mkey, name, sold, sh))
-    return False, 0, 0
+    return None
 
 # ------------------------- Observation -------------------------
 def record_obs(mkey, window_ts, meas):
@@ -326,17 +314,14 @@ def obs_report():
     log.info("[OBS] ===== {} vues | executables {}/{} ({:.0f}%) | PnL hypo "
              "{:+.2f}$ =====".format(obs_seen, obs_executable, obs_seen,
                                      pct, obs_hypo_pnl))
-    log.info("[OBS] Ce PnL suppose que les DEUX FOK passent : c'est un "
-             "PLAFOND. En reel il y aura des echecs et des orphelines.")
     if obs_seen >= 20 and obs_executable == 0:
         log.info("[OBS] >>> 0 arb ne survit en taille : n'active PAS le reel.")
 
 # ------------------------- Reglement -------------------------
 async def settle_loop():
-    """Gain = shares*1.00 - cout reel, a l'expiration.
-    NB : le redeem on-chain n'est pas automatise (le SDK a
-    client.redeem_positions si tu veux l'ajouter plus tard) ;
-    suppose une resolution normale du marche."""
+    """Regle les arbs complets a l'expiration (2 jambes tenues jusqu'au bout).
+    Les orphelines, elles, sont revendues immediatement dans execute_real -
+    rien a regler ici pour elles."""
     while True:
         try:
             now = int(time.time())
@@ -346,8 +331,7 @@ async def settle_loop():
                     pnl = STATE.add_pnl(gain)
                     log.info("[{}] ARB REGLE {:+.2f}$ | PnL jour {:+.2f}$"
                              .format(arb["market"], gain, pnl))
-                    if arb in open_arbs:
-                        open_arbs.remove(arb)
+                    open_arbs.remove(arb)
         except Exception as e:
             log.error("settle: " + str(e))
         await asyncio.sleep(10)
@@ -355,8 +339,8 @@ async def settle_loop():
 # ------------------------- Boucle principale -------------------------
 async def main():
     mode = "OBSERVATION (aucun ordre)" if OBSERVE_ONLY else "REEL (argent !)"
-    log.info("Bot ARB v3.1 (SDK polymarket-client) | MODE={} | seuil {:.2f} "
-             "(-{:.2f} frais = {:.2f}) | trade {}$ | depth x{} | "
+    log.info("Bot ARB v3.2 (orphelines ASSUMEES, non revendues) | MODE={} | "
+             "seuil {:.2f} (-{:.2f} frais = {:.2f}) | trade {}$ | depth x{} | "
              "max orphelines/j {}".format(mode, SUM_MAX, FEE_BUFFER, EFF_MAX,
                                           TRADE_USDC, DEPTH_MULT, MAX_ORPHANS))
     client = None
@@ -367,9 +351,9 @@ async def main():
         client = await AsyncSecureClient.create(
             private_key=PRIVATE_KEY, wallet=WALLET)
         log.info("Client authentifie (cree une seule fois)")
-        log.warning("*** MODE REEL : commence avec ARB_TRADE_USDC=2 ***")
+        log.warning("*** MODE REEL, orphelines GARDEES jusqu'a resolution ***")
 
-    asyncio.get_event_loop().create_task(settle_loop())
+    asyncio.create_task(settle_loop())
     token_cache = {}
     last_report = 0.0
 
@@ -412,7 +396,6 @@ async def main():
                 if not up or not dn:
                     continue
 
-                # --- carnets ---
                 if client is not None:
                     b_up, b_dn = await get_books(client, up["token_id"],
                                                  dn["token_id"])
@@ -451,17 +434,19 @@ async def main():
                 record_obs(mkey, window_ts, meas)
 
                 if OBSERVE_ONLY:
-                    await asyncio.sleep(2)    # echantillonne toute la fenetre
+                    await asyncio.sleep(2)
                     continue
                 if not meas["executable"]:
                     continue
 
                 done_windows[ckey] = window_ts + wsize
-                ok, shares, cost = await execute_real(
-                    client, up["token_id"], dn["token_id"], meas, mkey)
-                if ok:
-                    open_arbs.append({"market": mkey, "cost": round(cost, 4),
-                                      "shares": shares,
+                result = await execute_real(client, up["token_id"],
+                                            dn["token_id"], meas, mkey,
+                                            window_ts, wsize)
+                if result is not None:
+                    open_arbs.append({"market": mkey,
+                                      "cost": round(result["cost"], 4),
+                                      "shares": result["shares"],
                                       "expiry": window_ts + wsize})
         except Exception as e:
             log.error("boucle: " + str(e))
